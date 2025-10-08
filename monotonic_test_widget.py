@@ -1,10 +1,13 @@
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel,
     QGridLayout, QFrame, QLineEdit, QDoubleSpinBox, QComboBox,
-    QCheckBox, QListWidget,  QListWidgetItem, QMessageBox, QDialogButtonBox, QDialog, QFormLayout
+    QCheckBox, QListWidget,  QListWidgetItem, QMessageBox, QDialogButtonBox, QDialog, QFormLayout, QFileDialog
 )
 from PyQt6.QtCore import Qt, pyqtSignal, QLocale
 from PyQt6.QtGui import QFont, QDoubleValidator
+from data_saver import DataSaver
+from datetime import datetime
+
 import pyqtgraph as pg
 
 from custom_widgets import DisplayWidget
@@ -263,6 +266,7 @@ class MonotonicTestWidget(QWidget):
         self.modify_button.clicked.connect(self.on_modify_specimen)
         self.specimen_list.itemClicked.connect(self.on_specimen_selected)
         self.start_button.clicked.connect(self.on_start_test)
+        self.finish_save_button.clicked.connect(self.on_finish_and_save)
        
         #self.stop_button.clicked.connect(self.on_stop_test)
         # collegamento di debug temporaneo
@@ -390,6 +394,21 @@ class MonotonicTestWidget(QWidget):
 
         if self.current_specimen_name:
             self.specimens[self.current_specimen_name]['test_data'] = self.current_test_data
+
+                # --- NUOVO: LOGICA DI AUTOSAVE ---
+            try:
+                specimen_to_save = {self.current_specimen_name: self.specimens[self.current_specimen_name]}
+                # Crea un nome di file automatico
+                filename = f"AUTOSAVE_{self.current_specimen_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+
+                saver = DataSaver()
+                # Salva il singolo provino usando la stessa logica del batch
+                saver.save_batch_to_xlsx(specimen_to_save, filename, self.active_calibration_info)
+                print(f"DEBUG: Autosave completato per {self.current_specimen_name} in {filename}")
+            except Exception as e:
+                print(f"ERRORE AUTOSAVE: {e}")
+            # --- FINE AUTOSAVE ---
+
             specimen = self.specimens[self.current_specimen_name]
             if specimen.get("return_to_start", False):
                 self.send_command("RETURN_TO_START")
@@ -407,7 +426,7 @@ class MonotonicTestWidget(QWidget):
         relative_disp = disp_mm - self.displacement_offset_mm
         relative_load = load_N - self.load_offset_N
 
-        self.current_test_data.append((relative_disp, relative_load))
+        self.current_test_data.append((relative_disp, relative_load, disp_mm, load_N))
 
         # Aggiorna solo la curva del provino corrente
         if self.current_specimen_name in self.plot_curves:
@@ -888,3 +907,22 @@ class MonotonicTestWidget(QWidget):
     def set_current_force_limit(self, force_limit_n):
         self.current_force_limit_N = force_limit_n
 
+
+    def on_finish_and_save(self):
+        if not self.specimens:
+            QMessageBox.information(self, "Info", "Nessun provino da salvare.")
+            return
+
+        # Propone un nome di file di default
+        default_filename = f"Batch_{datetime.now().strftime('%Y-%m-%d_%H%M')}.xlsx"
+
+        # Apre la finestra di dialogo per il salvataggio
+        filepath, _ = QFileDialog.getSaveFileName(self, "Salva Batch di Test", default_filename, "Excel Files (*.xlsx)")
+
+        if filepath:
+            saver = DataSaver()
+            success, message = saver.save_batch_to_xlsx(self.specimens, filepath, self.active_calibration_info)
+            if success:
+                QMessageBox.information(self, "Successo", message)
+            else:
+                QMessageBox.critical(self, "Errore", message)
