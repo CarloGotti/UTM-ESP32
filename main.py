@@ -12,6 +12,7 @@ from communication import SerialCommunicator
 from settings_manager import SettingsManager
 from custom_widgets import LimitsDialog
 
+
 class MainWindow(QMainWindow):
     # --- NUOVO SEGNALE THREAD-SAFE ---
     # Questo segnale trasporterà il messaggio di errore dal thread di comunicazione
@@ -129,97 +130,79 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage("Disconnesso.")
 
     def handle_data_from_esp32(self, data: str):
-        print(f"[ESP32 RAW]: {data}") # --- NUOVA RIGA DI DEBUG ---
-        if data.startswith("DATA:"):
-            try:
-                payload = data.replace("DATA:", ""); parts = payload.split(';')
-                data_dict = {p.split('=')[0]: float(p.split('=')[1]) for p in parts}
-                
-                load_N = 0.0
-                displacement_mm = self.manual_control.absolute_displacement_mm # Mantiene l'ultimo valore se non arriva
-                
-                if 'LOAD' in data_dict:
-                    load_grams = data_dict['LOAD']; load_N = (load_grams / 1000.0) * 9.81
-                    self.manual_control.absolute_load_N = load_N
-                    self.monotonic_test_widget.absolute_load_N = load_N
-                    self.calibration_widget.abs_load_display.set_value(f"{load_N:.3f}")
-
-                if 'DISP' in data_dict:
-                    pulse_count = data_dict['DISP']
-                    displacement_mm = pulse_count * self.PULSES_TO_MM
-                    self.manual_control.absolute_displacement_mm = displacement_mm
-                    self.monotonic_test_widget.absolute_displacement_mm = displacement_mm
-                
-                # Se il test è in corso, invia i dati per il grafico
-                if self.monotonic_test_widget.is_test_running:
-                    self.monotonic_test_widget.handle_stream_data(load_N, displacement_mm)
-
-                # Aggiorna i display solo del widget visibile
-                current_widget = self.stacked_widget.currentWidget()
-                if hasattr(current_widget, 'update_displays'): 
-                    current_widget.update_displays()
-
-            except (ValueError, IndexError): 
-                pass 
+        print(f"[ESP32 RAW]: {data}")
         
-
-
-        elif data.startswith("D:"):
-        # nuovo formato snellito (streaming)
-            try:
-                payload = data[2:]  # rimuove "D:"
-                load_str, disp_str = payload.split(';')
-                load_grams = float(load_str)
-                pulse_count = int(disp_str)
-
-                load_N = (load_grams / 1000.0) * 9.81
-                displacement_mm = pulse_count * self.PULSES_TO_MM
-
-                self.manual_control.absolute_load_N = load_N
-                self.monotonic_test_widget.absolute_load_N = load_N
-                self.manual_control.absolute_displacement_mm = displacement_mm
-                self.monotonic_test_widget.absolute_displacement_mm = displacement_mm
-
-                if self.monotonic_test_widget.is_test_running:
-                    self.monotonic_test_widget.handle_stream_data(load_N, displacement_mm)
-
-                current_widget = self.stacked_widget.currentWidget()
-                if hasattr(current_widget, 'update_displays'):
-                    current_widget.update_displays()
-
-            except Exception:
-                pass
-
-        elif data.startswith("STATUS:"):
+        # --- BLOCCO UNICO PER LA GESTIONE DEI MESSAGGI ---
+        
+        # Se è un messaggio di STATO, gestiscilo e termina.
+        if data.startswith("STATUS:"):
             status_message = data.replace("STATUS:", "")
             self.statusBar().showMessage(f"Status: {status_message}", 5000)
 
-            # --- NUOVO BLOCCO PER GESTIONE LIMITI ---
-            # Controlla se il messaggio di stato indica che un limite è stato raggiunto.
-            # L'uso di "in" cattura sia LIMIT_HIT_FORCE che LIMIT_HIT_DISPLACEMENT.
+            # Gestione Limiti di Sicurezza
             if "LIMIT_HIT" in status_message:
-                # Non creare il popup qui!
-                # Emetti il segnale per chiedere al thread della GUI di farlo.
-                self.limit_hit_signal.emit(status_message)
-            # --- FINE NUOVO BLOCCO ---
+                QTimer.singleShot(10, lambda: self.show_limit_hit_popup(status_message))
             
-            if "HOMING_DONE" in status_message:
+            # Gestione Homing (LA SOLUZIONE)
+            elif "HOMING_COMPLETED" in status_message or "HOMED" in status_message:
+                # Imposta lo stato 'homed' su entrambi i widget
                 self.manual_control.is_homed = True
+                self.monotonic_test_widget.set_homing_status(True)
+                # Ripristina la UI del controllo manuale
                 self.manual_control.reset_homing_ui()
-                self.manual_control.update_displays()
-            elif "HIT" in status_message and self.manual_control.is_homing_active:
-                self.manual_control.reset_homing_ui()
-            # NUOVA GESTIONE STATO TEST
+                # Aggiorna i display per mostrare i valori numerici e rimuovere "Unhomed"
+                self.manual_control.update_displays() 
 
-            elif "TEST_STARTED" in status_message:
-                # conferma che il test è partito davvero
-                self.monotonic_test_widget.is_test_running = True
-                self.monotonic_test_widget.update_ui_for_test_state()  
-            elif "TEST_COMPLETED" in status_message or "TEST_STOPPED_BY_USER" in status_message or "TOP_HIT" in status_message:
-                print(f"DEBUG MAIN: stop test triggerato da status = {status_message}")
+            # Gestione Homing Interrotto dall'utente
+            elif "STOPPED_BY_USER" in status_message and self.manual_control.is_homing_active:
+                self.manual_control.reset_homing_ui()
+
+            # Gestione Stop del Test Monotonico (da comando o da fine test)
+            elif "TEST_COMPLETED" in status_message or ("TEST_STOPPED_BY_USER" in status_message and self.monotonic_test_widget.is_test_running) or "TOP_HIT" in status_message:
                 if self.monotonic_test_widget.is_test_running:
                     self.monotonic_test_widget.on_stop_test(user_initiated=False)
-                    QMessageBox.information(self, "Test Finished", f"The test ended with status: {status_message}")
+                    QMessageBox.information(self, "Test Terminato", f"Il test si è concluso con stato: {status_message}")
+            return # I messaggi di stato non contengono dati di telemetria, quindi usciamo.
+
+        # Se non è un messaggio di stato, allora è un messaggio di DATI.
+        load_N = None
+        displacement_mm = None
+        time_s = 0.0
+
+        try:
+            # Ora gestiamo SOLO il formato "D:", sia per lo streaming che per il polling
+            if data.startswith("D:"):
+                payload = data[2:]
+                load_str, disp_str, time_ms_str = payload.split(';')
+                load_grams = float(load_str)
+                pulse_count = int(disp_str)
+                time_s = float(time_ms_str) / 1000.0
+
+                load_N = (load_grams / 1000.0) * 9.81
+                displacement_mm = pulse_count * self.PULSES_TO_MM
+            else:
+                return # Se non è un messaggio 'D:' o 'STATUS:', ignora
+
+        except (ValueError, IndexError):
+            return # Ignora righe dati corrotte o malformate
+
+        # Se il parsing dei dati ha avuto successo, aggiorna l'applicazione
+        if load_N is not None and displacement_mm is not None:
+            # Aggiorna le variabili assolute in tutti i widget
+            self.manual_control.absolute_load_N = load_N
+            self.monotonic_test_widget.absolute_load_N = load_N
+            self.calibration_widget.abs_load_display.set_value(f"{load_N:.3f}")
+            self.manual_control.absolute_displacement_mm = displacement_mm
+            self.monotonic_test_widget.absolute_displacement_mm = displacement_mm
+
+            # Invia i dati in streaming al widget corrente (per i grafici)
+            current_widget = self.stacked_widget.currentWidget()
+            if hasattr(current_widget, 'handle_stream_data'):
+                current_widget.handle_stream_data(load_N, displacement_mm, time_s)
+            
+            # Aggiorna i display del widget corrente
+            if hasattr(current_widget, 'update_displays'):
+                current_widget.update_displays()
       
 
     def closeEvent(self, event):
