@@ -415,7 +415,7 @@ class MonotonicTestWidget(QWidget):
         # Aggiorna il grafico in base al provino selezionato e all'overlay
         self.refresh_plot()    
 
-    def handle_stream_data(self, load_N, disp_mm):
+    def handle_stream_data(self, load_N, disp_mm, time_s):
         if not self.is_test_running:
             return
 
@@ -426,9 +426,10 @@ class MonotonicTestWidget(QWidget):
         relative_disp = disp_mm - self.displacement_offset_mm
         relative_load = load_N - self.load_offset_N
 
-        self.current_test_data.append((relative_disp, relative_load, disp_mm, load_N))
+        # Salva la tupla a 5 elementi, con il tempo all'indice 0
+        self.current_test_data.append((time_s, relative_disp, relative_load, disp_mm, load_N))
 
-        # Aggiorna solo la curva del provino corrente
+        # Aggiorna la curva del grafico in tempo reale
         if self.current_specimen_name in self.plot_curves:
             specimen = self.specimens[self.current_specimen_name]
             area = specimen.get("area", 1.0)
@@ -437,18 +438,26 @@ class MonotonicTestWidget(QWidget):
             x_mode = self.x_axis_combo.currentText()
             y_mode = self.y_axis_combo.currentText()
 
-            x_data = [p[0] for p in self.current_test_data]
-            y_data = [p[1] for p in self.current_test_data]
+            # Estrai i dati per il grafico usando gli indici corretti
+            # Spostamento Relativo è all'indice 1, Carico Relativo è all'indice 2
+            x_raw_data = [p[1] for p in self.current_test_data] 
+            y_raw_data = [p[2] for p in self.current_test_data]
 
-            if "Strain" in x_mode:
-                x_data = [(d / gauge) * 100 for d in x_data]
-            if "Stress" in y_mode:
-                y_data = [(f / area) for f in y_data]
+            if "Strain" in x_mode and gauge > 0:
+                x_data_final = [(d / gauge) * 100 for d in x_raw_data]
+            else:
+                x_data_final = x_raw_data
 
-            self.plot_curves[self.current_specimen_name].setData(x_data, y_data)
+            if "Stress" in y_mode and area > 0:
+                y_data_final = [(f / area) for f in y_raw_data]
+            else:
+                y_data_final = y_raw_data
+
+            self.plot_curves[self.current_specimen_name].setData(x_data_final, y_data_final)
             self.plot_widget.setLabel("bottom", x_mode)
             self.plot_widget.setLabel("left", y_mode)
-        # Aggiorna i display in tempo reale
+        
+        # Aggiorna i display numerici (i contatori)
         self.update_displays()
         
 
@@ -823,8 +832,8 @@ class MonotonicTestWidget(QWidget):
         def convert_data(specimen, raw_data):
             area = specimen.get("area", 1.0)
             gauge = specimen.get("gauge_length", 1.0)
-            x_raw = [p[0] for p in raw_data]
-            y_raw = [p[1] for p in raw_data]
+            x_raw = [p[1] for p in raw_data]
+            y_raw = [p[2] for p in raw_data]
 
             if "Strain" in x_mode:
                 x = [(d / gauge) * 100 for d in x_raw]

@@ -7,6 +7,7 @@ from openpyxl.chart.shapes import GraphicalProperties
 from openpyxl.chart.axis import ChartLines
 from openpyxl.chart import Series
 from datetime import datetime
+import numpy as np
 
 class DataSaver:
     """
@@ -64,30 +65,37 @@ class DataSaver:
         data_start_row = header_row + 1
 
         headers = [
-            "Relative Displacement (mm)", "Relative Load (N)",
+            "Time (s)", "Relative Displacement (mm)", "Relative Load (N)",
             "Strain (%)", "Stress (MPa)",
             "Absolute Displacement (mm)", "Absolute Load (N)"
         ]
         sheet.append(headers)
 
         test_data = specimen_data.get("test_data", [])
-        area = specimen_data.get("area", 1.0)
-        gauge = specimen_data.get("gauge_length", 1.0)
+        area = specimen_data.get("area")
+        gauge = specimen_data.get("gauge_length")
+
         
         # Le colonne A e B conterranno sempre RelDisp e RelLoad, che sono i dati grezzi
-        for i, (rel_disp, rel_load, abs_disp, abs_load) in enumerate(test_data):
+        for i, (time_s, rel_disp, rel_load, abs_disp, abs_load) in enumerate(test_data):
             # Calcola le altre colonne derivate
-            strain = (rel_disp / gauge) * 100 if gauge > 0 else 0
-            stress = rel_load / area if area > 0 else 0
+          # Controlla che 'gauge' sia un numero valido e > 0
+            is_gauge_valid = isinstance(gauge, (int, float)) and not np.isnan(gauge) and gauge > 0
+            strain = (rel_disp / gauge) * 100 if is_gauge_valid else np.nan
+
+            # Controlla che 'area' sia un numero valido e > 0
+            is_area_valid = isinstance(area, (int, float)) and not np.isnan(area) and area > 0
+            stress = rel_load / area if is_area_valid else np.nan
             # Nota: i dati assoluti non sono salvati per punto, questa è un'approssimazione
             # Se ti servono, dovrai modificare la struttura dati di `current_test_data`
             
-            sheet.cell(row=data_start_row + i, column=1, value=rel_disp)
-            sheet.cell(row=data_start_row + i, column=2, value=rel_load)
-            sheet.cell(row=data_start_row + i, column=3, value=strain)
-            sheet.cell(row=data_start_row + i, column=4, value=stress)
-            sheet.cell(row=data_start_row + i, column=5, value=abs_disp)
-            sheet.cell(row=data_start_row + i, column=6, value=abs_load)
+            sheet.cell(row=data_start_row + i, column=1, value=time_s)
+            sheet.cell(row=data_start_row + i, column=2, value=rel_disp)
+            sheet.cell(row=data_start_row + i, column=3, value=rel_load)
+            sheet.cell(row=data_start_row + i, column=4, value=strain)
+            sheet.cell(row=data_start_row + i, column=5, value=stress)
+            sheet.cell(row=data_start_row + i, column=6, value=abs_disp)
+            sheet.cell(row=data_start_row + i, column=7, value=abs_load)
 
         num_data_points = len(test_data)
         if num_data_points == 0:
@@ -106,8 +114,9 @@ class DataSaver:
         chart1.x_axis.titleOverlay = False
         chart1.y_axis.titleOverlay = False
         
-        x_data_ref = Reference(sheet, min_col=1, min_row=header_row + 2, max_row=header_row + num_data_points)
-        y_data_ref = Reference(sheet, min_col=2, min_row=header_row + 2, max_row=header_row + num_data_points)
+        x_data_ref = Reference(sheet, min_col=2, min_row=header_row + 2, max_row=header_row + num_data_points)
+        y_data_ref = Reference(sheet, min_col=3, min_row=header_row + 2, max_row=header_row + num_data_points)
+        #...
 
         series1 = Series(y_data_ref, xvalues=x_data_ref, title="Test Data")
         line_props1 = LineProperties(solidFill="4F81BD", w=38100) # w=38100 è circa 3pt
@@ -152,8 +161,8 @@ class DataSaver:
         chart2.y_axis.graphicalProperties.ln = line_props
 
         
-        x_data_ref2 = Reference(sheet, min_col=3, min_row=header_row + 2, max_row=header_row + num_data_points)
-        y_data_ref2 = Reference(sheet, min_col=4, min_row=header_row + 2, max_row=header_row + num_data_points)
+        x_data_ref2 = Reference(sheet, min_col=4, min_row=header_row + 2, max_row=header_row + num_data_points)
+        y_data_ref2 = Reference(sheet, min_col=5, min_row=header_row + 2, max_row=header_row + num_data_points)
         series2 = Series(y_data_ref2, xvalues=x_data_ref2, title="Test Data")
         series2.graphicalProperties = GraphicalProperties(ln=line_props1)
         chart2.series.append(series2)
