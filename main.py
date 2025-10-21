@@ -8,6 +8,7 @@ from main_menu_widget import MainMenuWidget
 from manual_control_widget import ManualControlWidget
 from calibration_widget import CalibrationWidget
 from monotonic_test_widget import MonotonicTestWidget
+from cyclic_test_widget import CyclicTestWidget
 from communication import SerialCommunicator 
 from settings_manager import SettingsManager
 from custom_widgets import LimitsDialog
@@ -18,6 +19,7 @@ class MainWindow(QMainWindow):
     # Questo segnale trasporterà il messaggio di errore dal thread di comunicazione
     # al thread principale della GUI in modo sicuro.
     limit_hit_signal = pyqtSignal(str)
+    
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Software Controllo Macchina di Trazione")
@@ -60,18 +62,23 @@ class MainWindow(QMainWindow):
         self.main_menu = MainMenuWidget()
         self.manual_control = ManualControlWidget(self.communicator)
         self.calibration_widget = CalibrationWidget(self.communicator, self.settings['cal_loads'])
-        self.monotonic_test_widget = MonotonicTestWidget(self.communicator)
+        self.monotonic_test_widget = MonotonicTestWidget(self.communicator, self)
+        self.cyclic_test = CyclicTestWidget(self.communicator, self)
         
         self.stacked_widget.addWidget(self.main_menu); self.stacked_widget.addWidget(self.manual_control)
-        self.stacked_widget.addWidget(self.calibration_widget); self.stacked_widget.addWidget(self.monotonic_test_widget)
+        self.stacked_widget.addWidget(self.calibration_widget); self.stacked_widget.addWidget(self.monotonic_test_widget); self.stacked_widget.addWidget(self.cyclic_test)
         
         self.main_menu.manual_button.clicked.connect(self.show_manual_control)
         self.main_menu.calibrate_button.clicked.connect(self.show_calibration)
         self.main_menu.monotonic_button.clicked.connect(self.show_monotonic_test)
+        self.main_menu.cyclic_button.clicked.connect(self.show_cyclic_test)
         
         self.manual_control.back_to_menu_requested.connect(self.show_main_menu)
         self.calibration_widget.back_to_menu_requested.connect(self.show_main_menu)
         self.monotonic_test_widget.back_to_menu_requested.connect(self.show_main_menu)
+        self.cyclic_test.back_to_menu_requested.connect(self.show_main_menu)
+        self.cyclic_test.limits_button_requested.connect(self.show_limits_dialog)
+        
 
         self.manual_control.limits_button_requested.connect(self.show_limits_dialog)
         self.monotonic_test_widget.limits_button_requested.connect(self.show_limits_dialog)
@@ -138,7 +145,99 @@ class MainWindow(QMainWindow):
         if data.startswith("STATUS:"):
             status_message = data.replace("STATUS:", "")
             self.statusBar().showMessage(f"Status: {status_message}", 5000)
+            # --- GESTIONE MESSAGGI CICLICI ---
+            if "CYCLIC_TEST_STARTED" in status_message or "CYCLIC_PREPOSITIONING" in status_message:
+                # La UI è già stata aggiornata da on_start_test
+                pass # Non fare nulla di speciale qui
+            
+            elif "BLOCK_COMPLETED" in status_message:
+                widget = self.cyclic_test # Riferimento al widget ciclico
+                widget.current_block_index += 1 # Passa al blocco successivo
 
+                if widget.current_block_index < len(widget.test_sequence):
+                    # C'è un altro blocco, invia il comando
+                    next_block = widget.test_sequence[widget.current_block_index]
+
+                    if next_block["type"] == "cyclic":
+                        # --- BLOCCO CICLICO (invariato) ---
+                        control_mode_base = next_block["base_unit"].upper()
+                        if control_mode_base == "MM":
+                            control_mode_fw = "DISP"
+                            abs_upper_mm = next_block["upper_conv"] + widget.displacement_offset_mm
+                            abs_lower_mm = next_block["lower_conv"] + widget.displacement_offset_mm
+                            upper_fw = abs_upper_mm; lower_fw = abs_lower_mm
+                        else: # "N"
+                            control_mode_fw = "FORCE"
+                            abs_upper_N = next_block["upper_conv"] + widget.load_offset_N
+                            abs_lower_N = next_block["lower_conv"] + widget.load_offset_N
+                            upper_fw = (abs_upper_N / 9.81) * 1000.0
+                            lower_fw = (abs_lower_N / 9.81) * 1000.0
+                        speed_mms = next_block["speed_mms"]
+                        hold_upper_ms = int(next_block["hold_upper"] * 1000)
+                        hold_lower_ms = int(next_block["hold_lower"] * 1000)
+                        cycles = next_block["cycles"]
+                        command = (f"START_CYCLIC_TEST:"
+                                   f"MODE={control_mode_fw};UPPER={upper_fw:.4f};LOWER={lower_fw:.4f};"
+                                   f"SPEED={speed_mms:.3f};HOLD_U={hold_upper_ms};HOLD_L={hold_lower_ms};CYCLES={cycles}")
+                        self.communicator.send_command(command)
+                        print(f"DEBUG Main: Avviato Blocco Ciclico {widget.current_block_index + 1}")
+
+                    elif next_block["type"] == "pause":
+                        # --- BLOCCO PAUSA (invariato) ---
+                        duration_ms = int(next_block["duration"] * 1000)
+                        command = f"EXECUTE_PAUSE:{duration_ms}"
+                        self.communicator.send_command(command)
+                        print(f"DEBUG Main: Avviata Pausa {widget.current_block_index + 1} ({duration_ms} ms)")
+
+                    # --- NUOVO BLOCCO PER GESTIRE LA RAMPA ---
+                    elif next_block["type"] == "ramp":
+                        control_mode_base = next_block["base_unit"].upper() # Sarà "MM" o "N"
+                        if control_mode_base == "MM":
+                            control_mode_fw = "DISP"
+                            abs_target_mm = next_block["target_conv"] + widget.displacement_offset_mm
+                            target_fw = abs_target_mm # Il firmware si aspetta mm
+                        else: # "N"
+                            control_mode_fw = "FORCE"
+                            abs_target_N = next_block["target_conv"] + widget.load_offset_N
+                            target_fw = (abs_target_N / 9.81) * 1000.0 # Converti N assoluti in grammi
+
+                        speed_mms = next_block["speed_mms"]
+                        hold_ms = int(next_block["hold_duration"] * 1000)
+
+                        # Costruisci il nuovo comando per il firmware
+                        command = (f"EXECUTE_RAMP:"
+                                   f"MODE={control_mode_fw};" # DISP o FORCE
+                                   f"TARGET={target_fw:.4f};" # mm o grammi ASSOLUTI
+                                   f"SPEED={speed_mms:.3f};"
+                                   f"HOLD={hold_ms}")
+                        self.communicator.send_command(command)
+                        print(f"DEBUG Main: Avviata Rampa {widget.current_block_index + 1}")
+                    # --- FINE NUOVO BLOCCO RAMPA ---
+                else:
+                     # --- INIZIO CORREZIONE ---
+                     # Non ci sono altri blocchi. La sequenza è completata.
+                     # Chiama manualmente la funzione di stop della UI.
+                     print(f"DEBUG Main: Sequenza completata. Tutti i {widget.current_block_index} blocchi eseguiti.")
+                     self.communicator.send_command("SET_MODE:POLLING")
+                     if self.cyclic_test.is_test_running:
+                         self.cyclic_test.on_stop_test(user_initiated=False)
+                         QMessageBox.information(self, "Test Ciclico Terminato", "Sequenza di test completata.")
+                     # --- FINE CORREZIONE ---
+
+
+            elif "CYCLIC_TEST_COMPLETED" in status_message or \
+                 ("CYCLIC_TEST_STOPPED_BY_USER" in status_message and self.cyclic_test.is_test_running) or \
+                 ("TOP_HIT" in status_message and self.cyclic_test.is_test_running) or \
+                 ("BOTTOM_HIT" in status_message and self.cyclic_test.is_test_running):
+                 
+                 # Il test è finito (completato, stoppato, o endstop colpito), aggiorna la UI
+                 if self.cyclic_test.is_test_running:
+                     self.cyclic_test.on_stop_test(user_initiated=False)
+                     # Mostra un popup diverso se è un endstop
+                     if "TOP_HIT" in status_message or "BOTTOM_HIT" in status_message:
+                         QMessageBox.critical(self, "Endstop Colpito", f"Test interrotto: {status_message}")
+                     else:
+                         QMessageBox.information(self, "Test Ciclico Terminato", f"Il test si è concluso con stato: {status_message}")
             # Gestione Limiti di Sicurezza
             if "LIMIT_HIT" in status_message:
                 QTimer.singleShot(10, lambda: self.show_limit_hit_popup(status_message))
@@ -148,6 +247,8 @@ class MainWindow(QMainWindow):
                 # Imposta lo stato 'homed' su entrambi i widget
                 self.manual_control.is_homed = True
                 self.monotonic_test_widget.set_homing_status(True)
+                # *** NUOVO: Imposta homing anche per il widget ciclico ***
+                self.cyclic_test.set_homing_status(True) 
                 # Ripristina la UI del controllo manuale
                 self.manual_control.reset_homing_ui()
                 # Aggiorna i display per mostrare i valori numerici e rimuovere "Unhomed"
@@ -158,49 +259,96 @@ class MainWindow(QMainWindow):
                 self.manual_control.reset_homing_ui()
 
             # Gestione Stop del Test Monotonico (da comando o da fine test)
-            elif "TEST_COMPLETED" in status_message or ("TEST_STOPPED_BY_USER" in status_message and self.monotonic_test_widget.is_test_running) or "TOP_HIT" in status_message:
+            elif "TEST_COMPLETED" in status_message or \
+                 ("TEST_STOPPED_BY_USER" in status_message and self.monotonic_test_widget.is_test_running) or \
+                 ("TOP_HIT" in status_message and self.monotonic_test_widget.is_test_running) or \
+                 ("BOTTOM_HIT" in status_message and self.monotonic_test_widget.is_test_running):
+                 
                 if self.monotonic_test_widget.is_test_running:
                     self.monotonic_test_widget.on_stop_test(user_initiated=False)
-                    QMessageBox.information(self, "Test Terminato", f"Il test si è concluso con stato: {status_message}")
+                    # Mostra un popup diverso se è un endstop
+                    if "TOP_HIT" in status_message or "BOTTOM_HIT" in status_message:
+                        QMessageBox.critical(self, "Endstop Colpito", f"Test interrotto: {status_message}")
+                    else:
+                        QMessageBox.information(self, "Test Terminato", f"Il test si è concluso con stato: {status_message}")
+            
+            
             return # I messaggi di stato non contengono dati di telemetria, quindi usciamo.
 
         # Se non è un messaggio di stato, allora è un messaggio di DATI.
         load_N = None
         displacement_mm = None
         time_s = 0.0
-
+        cycle_count = 0 # Inizializza
         try:
             # Ora gestiamo SOLO il formato "D:", sia per lo streaming che per il polling
             if data.startswith("D:"):
                 payload = data[2:]
-                load_str, disp_str, time_ms_str = payload.split(';')
+                
+                # --- QUESTA È LA CORREZIONE DEFINITIVA ---
+                parts = payload.split(';') # Divide il payload in una lista
+                
+                if len(parts) == 4:
+                    # Formato STREAMING (load, pulses, time, cycle)
+                    load_str, disp_str, time_ms_str, cycle_str = parts
+                    cycle_count = int(cycle_str)
+                elif len(parts) == 3:
+                    # Formato POLLING (load, pulses, time=0)
+                    load_str, disp_str, time_ms_str = parts
+                    cycle_count = 0 # Imposta il ciclo a 0 di default
+                else:
+                    # Pacchetto corrotto o numero di valori inatteso
+                    raise ValueError(f"Attesi 3 o 4 valori, ricevuti {len(parts)}")
+                
+                # Parsing comune
                 load_grams = float(load_str)
                 pulse_count = int(disp_str)
                 time_s = float(time_ms_str) / 1000.0
+                # --- FINE CORREZIONE ---
 
                 load_N = (load_grams / 1000.0) * 9.81
                 displacement_mm = pulse_count * self.PULSES_TO_MM
             else:
                 return # Se non è un messaggio 'D:' o 'STATUS:', ignora
 
-        except (ValueError, IndexError):
+        except (ValueError, IndexError) as e:
+            print(f"ERRORE PARSING: {e} | Dati: {data}") # Aggiunto debug
             return # Ignora righe dati corrotte o malformate
 
         # Se il parsing dei dati ha avuto successo, aggiorna l'applicazione
         if load_N is not None and displacement_mm is not None:
-            # Aggiorna le variabili assolute in tutti i widget
-            self.manual_control.absolute_load_N = load_N
-            self.monotonic_test_widget.absolute_load_N = load_N
-            self.calibration_widget.abs_load_display.set_value(f"{load_N:.3f}")
-            self.manual_control.absolute_displacement_mm = displacement_mm
-            self.monotonic_test_widget.absolute_displacement_mm = displacement_mm
+            current_widget = self.stacked_widget.currentWidget()
+
+            # --- AGGIORNAMENTO CENTRALIZZATO (Come nella versione STABLE) ---
+            # Aggiorna le variabili assolute in TUTTI i widget che le possiedono
+            
+            # Manual Control
+            if hasattr(self.manual_control, 'absolute_load_N'):
+                self.manual_control.absolute_load_N = load_N
+                self.manual_control.absolute_displacement_mm = displacement_mm
+                
+            # Monotonic Test
+            if hasattr(self.monotonic_test_widget, 'absolute_load_N'):
+                self.monotonic_test_widget.absolute_load_N = load_N
+                self.monotonic_test_widget.absolute_displacement_mm = displacement_mm
+                
+            # Cyclic Test (Aggiunto)
+            if hasattr(self.cyclic_test, 'absolute_load_N'):
+                self.cyclic_test.absolute_load_N = load_N
+                self.cyclic_test.absolute_displacement_mm = displacement_mm
+
+            # Calibration Widget (Caso speciale)
+            if hasattr(self.calibration_widget, 'abs_load_display'):
+                 self.calibration_widget.abs_load_display.set_value(f"{load_N:.3f}")
+            # --- FINE AGGIORNAMENTO CENTRALIZZATO ---
 
             # Invia i dati in streaming al widget corrente (per i grafici)
-            current_widget = self.stacked_widget.currentWidget()
             if hasattr(current_widget, 'handle_stream_data'):
-                current_widget.handle_stream_data(load_N, displacement_mm, time_s)
+                # Passa tutti i dati, inclusi tempo e ciclo
+                current_widget.handle_stream_data(load_N, displacement_mm, time_s, cycle_count)
             
-            # Aggiorna i display del widget corrente
+            # --- AGGIORNAMENTO DISPLAY (COME NELLA VERSIONE STABLE) ---
+            # Aggiorna i display del widget corrente (es. i contatori)
             if hasattr(current_widget, 'update_displays'):
                 current_widget.update_displays()
       
@@ -237,7 +385,7 @@ class MainWindow(QMainWindow):
             # Assicura che la schermata sia aggiornata con lo stato più recente prima di essere mostrata
             self.monotonic_test_widget.set_homing_status(True)
             self.monotonic_test_widget.set_calibration_status(self.active_calibration_info)
-            self.monotonic_test_widget.set_current_force_limit(self.current_force_limit_N)
+
             self.stacked_widget.setCurrentWidget(self.monotonic_test_widget)
         else:
             msg_box = QMessageBox(self)
@@ -247,6 +395,14 @@ class MainWindow(QMainWindow):
             msg_box.setStandardButtons(QMessageBox.StandardButton.Ok)
             msg_box.exec()
 
+    def show_cyclic_test(self):
+        # Controlla se l'homing è stato fatto prima di accedere
+        if self.manual_control.is_homed:
+            self.cyclic_test.set_homing_status(True) # Informa la schermata
+            self.stacked_widget.setCurrentWidget(self.cyclic_test)
+        else:
+            QMessageBox.warning(self, "Homing Richiesto", "Eseguire la procedura di Homing prima di avviare un test ciclico.")
+    
     def show_main_menu(self):
         self.stacked_widget.setCurrentWidget(self.main_menu)
 
@@ -268,6 +424,11 @@ class MainWindow(QMainWindow):
             
             if self.monotonic_test_widget.is_test_running:
                 self.monotonic_test_widget.on_stop_test(user_initiated=False)
+            
+            # --- INIZIO CORREZIONE: Sblocca anche la UI ciclica ---
+            if self.cyclic_test.is_test_running:
+                self.cyclic_test.on_stop_test(user_initiated=False)
+            # --- FINE CORREZIONE ---
 
         QTimer.singleShot(10, perform_limit_hit_actions)
 

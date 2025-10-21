@@ -18,17 +18,14 @@ class MonotonicTestWidget(QWidget):
     back_to_menu_requested = pyqtSignal()
     limits_button_requested = pyqtSignal() # <-- NUOVO SEGNALE
 
-    def __init__(self, communicator, parent=None):
+    def __init__(self, communicator, main_window, parent=None):
         super().__init__(parent)
         self.communicator = communicator
+        self.main_window = main_window
 
         # --- STATO INTERNO ---
         self.is_homed = False
         self.active_calibration_info = "Not Calibrated"
-        self.current_force_limit_N = 1000.0
-
-        
-
 
         # --- FINE NUOVE VARIABILI ---
         self.specimens = {}
@@ -333,8 +330,8 @@ class MonotonicTestWidget(QWidget):
             if target_force_abs_N > self.current_force_limit_N:
                 reply = QMessageBox.warning(
                     self, "Limite di Sicurezza Superato",
-                    f"La forza target calcolata ({target_force_abs_N:.2f} N) supera il limite di sicurezza impostato ({self.current_force_limit_N:.2f} N).\n\n"
-                    "Continuare comunque a proprio rischio e pericolo?",
+                    f"La forza target ... supera il limite ... ({self.main_window.current_force_limit_N:.2f} N).\n\n" 
+                    "Continuare ...?",
                     QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                     QMessageBox.StandardButton.No
                 )
@@ -415,7 +412,7 @@ class MonotonicTestWidget(QWidget):
         # Aggiorna il grafico in base al provino selezionato e all'overlay
         self.refresh_plot()    
 
-    def handle_stream_data(self, load_N, disp_mm, time_s):
+    def handle_stream_data(self, load_N, disp_mm, time_s, cycle_count):
         if not self.is_test_running:
             return
 
@@ -564,6 +561,31 @@ class MonotonicTestWidget(QWidget):
             speed_mm_s = self.convert_speed(speed_value, speed_unit, gauge_length)
             stop_converted, stop_base_unit = self.convert_stop_criterion(stop_value, stop_unit, gauge_length, area)
 
+# --- NUOVO: VALIDAZIONE LIMITI ---
+            validation_passed = True
+            error_message = ""
+            if stop_base_unit == "mm":
+                limit_to_check = self.main_window.current_disp_limit_mm
+                # Controlla se il target di spostamento (assoluto) supera il limite
+                # Nota: stop_converted è relativo, dobbiamo considerare l'offset attuale
+                target_absolute_disp = stop_converted + self.displacement_offset_mm
+                if abs(target_absolute_disp) > limit_to_check:
+                    validation_passed = False
+                    error_message = (f"The calculated absolute stop displacement ({target_absolute_disp:.2f} mm) "
+                                     f"exceeds the machine limit of ±{limit_to_check:.2f} mm.")
+            elif stop_base_unit == "N":
+                limit_to_check = self.main_window.current_force_limit_N
+                # Controlla se il target di forza (assoluto) supera il limite
+                target_absolute_force = stop_converted + self.load_offset_N
+                if target_absolute_force > limit_to_check:
+                     validation_passed = False
+                     error_message = (f"The calculated absolute stop force ({target_absolute_force:.2f} N) "
+                                      f"exceeds the machine limit of {limit_to_check:.2f} N.")
+
+            if not validation_passed:
+                QMessageBox.warning(self, "Limit Exceeded", error_message)
+                return # Non creare il provino
+
             specimen_data = {
                 "name": name,
                 "gauge_length": gauge_length,
@@ -667,6 +689,28 @@ class MonotonicTestWidget(QWidget):
                 stop_value = self.stop_criterion_spinbox.value()
                 stop_unit = self.stop_criterion_combo.currentText()
                 stop_converted, stop_base_unit = self.convert_stop_criterion(stop_value, stop_unit, new_gauge_length, new_area)
+
+# --- NUOVO: VALIDAZIONE LIMITI (IDENTICA A on_new_specimen) ---
+                validation_passed = True
+                error_message = ""
+                if stop_base_unit == "mm":
+                    limit_to_check = self.main_window.current_disp_limit_mm
+                    target_absolute_disp = stop_converted + self.displacement_offset_mm
+                    if abs(target_absolute_disp) > limit_to_check:
+                        validation_passed = False
+                        error_message = (f"The calculated absolute stop displacement ({target_absolute_disp:.2f} mm) "
+                                        f"exceeds the machine limit of ±{limit_to_check:.2f} mm.")
+                elif stop_base_unit == "N":
+                    limit_to_check = self.main_window.current_force_limit_N
+                    target_absolute_force = stop_converted + self.load_offset_N
+                    if target_absolute_force > limit_to_check:
+                        validation_passed = False
+                        error_message = (f"The calculated absolute stop force ({target_absolute_force:.2f} N) "
+                                        f"exceeds the machine limit of {limit_to_check:.2f} N.")
+
+                if not validation_passed:
+                    QMessageBox.warning(self, "Limit Exceeded", error_message)
+                    return # Non modificare il provino
 
                 modified_data.update({
                     "speed": speed_value,
@@ -913,8 +957,6 @@ class MonotonicTestWidget(QWidget):
         else:
             return value, unit
 
-    def set_current_force_limit(self, force_limit_n):
-        self.current_force_limit_N = force_limit_n
 
 
     def on_finish_and_save(self):

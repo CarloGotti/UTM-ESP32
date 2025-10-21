@@ -149,7 +149,7 @@ class ManualControlWidget(QWidget):
         # --- FINE ---
         self.update_displays(); self.update_speed_controls()
 
-    def handle_stream_data(self, load_N, disp_mm, time_s):
+    def handle_stream_data(self, load_N, disp_mm, time_s, cycle_count):
              # Se la schermata non è visibile, non fare nulla
         if not self.isVisible():
             self.plot_start_time = 0 # Resetta il tempo se la schermata viene nascosta

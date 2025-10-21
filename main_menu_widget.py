@@ -39,5 +39,5 @@ class MainMenuWidget(QWidget):
         # --- Stato dei pulsanti ---
         self.calibrate_button.setEnabled(True)
         self.monotonic_button.setEnabled(True) # MODIFICA: Abilitato per accedere alla nuova schermata
-        self.cyclic_button.setEnabled(False)
+        self.cyclic_button.setEnabled(True)
         self.exit_button.clicked.connect(QApplication.instance().quit)

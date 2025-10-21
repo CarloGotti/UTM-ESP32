@@ -49,7 +49,7 @@ class SerialCommunicator(QObject):
                 command = self.command_queue.get()
                 if self.serial_port and self.serial_port.is_open:
                     try:
-                        print(f"DEBUG COMM: scrivo {command}")
+                        #print(f"DEBUG COMM: scrivo {command}")
                         self.serial_port.write(f"{command}\n".encode("utf-8"))
                         self.serial_port.flush()
                     except serial.SerialException as e:
