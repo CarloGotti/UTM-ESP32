@@ -44,7 +44,7 @@ enum MotorState { STOPPED, JOG_UP, JOG_DOWN, HOMING, MONOTONIC_TEST, CYCLIC_TEST
 MotorState motor_state = STOPPED;
 MotorState previous_motor_state = STOPPED;
 bool is_hardware_jog_active = false;
-enum HomingPhase { HOMING_FAST, HOMING_BACKOFF, HOMING_SLOW };
+enum HomingPhase { HOMING_FAST, HOMING_BACKOFF, HOMING_SLOW, HOMING_FINAL_LIFT };
 HomingPhase homing_phase;
 
 // --- ISR TIMER ---
@@ -167,7 +167,7 @@ void loop()
   handleSerialCommands();
   handleDataStreaming();
   updateMotorState();
-  handleHardwareInputs();
+  //handleHardwareInputs();  TEMPORANEAMENTE DISABILITATO TASTI FISICI
 }
 
 // --- Gestione seriale non bloccante ---
@@ -689,31 +689,34 @@ void updateMotorState()
 
   previous_motor_state = motor_state;
 
-  // --- Controllo endstop ---
+  // --- Controllo endstop (Logica Corretta) ---
   bool top_hit = (digitalRead(TOP_ENDSTOP_PIN) == LOW);
   bool bottom_hit = (digitalRead(BOTTOM_ENDSTOP_PIN) == LOW);
-  
-  should_stop = false; // Azzera la variabile
+
+  bool force_stop_due_to_endstop = false; // Flag specifico per questa logica
   String status_msg = "";
 
-  if (top_hit) {
-      should_stop = true;
+  // Controlla TOP endstop: ferma solo se stiamo salendo (dir_up = true)
+  if (top_hit && dir_up) {
+      force_stop_due_to_endstop = true;
       status_msg = "STATUS:TOP_HIT";
-  } 
-  else if (bottom_hit) { 
-      if (motor_state != HOMING) {
-          should_stop = true;
-          status_msg = "STATUS:BOTTOM_HIT";
-      }
+  }
+  // Controlla BOTTOM endstop: ferma solo se stiamo scendendo (dir_up = false)
+  // E ignora questo controllo durante l'homing
+  else if (bottom_hit && !dir_up && motor_state != HOMING) {
+      force_stop_due_to_endstop = true;
+      status_msg = "STATUS:BOTTOM_HIT";
   }
 
-  if (should_stop && motor_state != STOPPED)
+  // Applica lo stop forzato SE necessario E se non siamo già fermi
+  if (force_stop_due_to_endstop && motor_state != STOPPED)
   {
-    motor_state = STOPPED;
-    comms_mode = POLLING;
-    stopMotor();
-    Serial.println(status_msg);
+    motor_state = STOPPED; // Forza lo stato a STOPPED
+    comms_mode = POLLING;  // Torna in polling se colpisci un limite manualmente
+    stopMotor();          // Ferma il motore
+    Serial.println(status_msg); // Invia lo stato
   }
+  // --- Fine Controllo endstop ---
 
   // --- Homing ---
   if (motor_state == HOMING) {
@@ -732,7 +735,7 @@ void updateMotorState()
     }
     else if (homing_phase == HOMING_BACKOFF && move_completed_flag) {
         move_completed_flag = false; 
-        setMotorSpeed(0.3);
+        setMotorSpeed(1);
         dir_up = false;
         digitalWrite(DIR_PIN, LOW);
         motor_enabled = true;
@@ -740,12 +743,38 @@ void updateMotorState()
         Serial.println("STATUS:HOMING_SLOW");
     }
     else if (homing_phase == HOMING_SLOW && bottom_hit) {
-      stopMotor();
-      pulse_count = 0;
-      motor_state = STOPPED;
-      comms_mode = POLLING;
-      Serial.println("STATUS:HOMING_COMPLETED");
-      Serial.println("STATUS:HOMED");
+        // Endstop colpito durante la discesa lenta
+        stopMotor(); // Ferma immediatamente
+
+        // --- INIZIO NUOVA LOGICA: SOLLEVAMENTO FINALE ---
+        long steps_to_lift = (long)(5.0 / PULSES_TO_MM); // Calcola passi per 5mm
+
+        // Imposta i parametri per il movimento verso l'alto
+        setMotorSpeed(1); // Usa una velocità ragionevole (es. quella di ritorno)
+        dir_up = true;
+        digitalWrite(DIR_PIN, HIGH);
+        target_steps_remaining = steps_to_lift; // Imposta il target di passi
+        motor_enabled = true; // Avvia il movimento
+
+        // Passa alla nuova fase di sollevamento
+        homing_phase = HOMING_FINAL_LIFT;
+        Serial.println("STATUS:HOMING_LIFTING"); // Invia nuovo stato
+        // --- FINE NUOVA LOGICA ---
+
+    }
+    else if (homing_phase == HOMING_FINAL_LIFT && move_completed_flag) {
+        // Il movimento di 5mm verso l'alto è terminato
+        move_completed_flag = false; // Consuma il flag
+        stopMotor(); // Assicura che il motore sia fermo
+
+        // ORA azzera la posizione
+        pulse_count = 0; 
+
+        // Finalizza lo stato di homing
+        motor_state = STOPPED;
+        comms_mode = POLLING; // Torna in polling
+        Serial.println("STATUS:HOMING_COMPLETED");
+        Serial.println("STATUS:HOMED"); // Segnala che la macchina è pronta
 
 /*       // --- NUOVO: Avvia un movimento di 5mm verso l'alto ---
       long steps_to_move_up = (long)(5.0 / PULSES_TO_MM); // 5mm
