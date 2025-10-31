@@ -9,6 +9,7 @@ from data_saver import DataSaver
 from datetime import datetime
 
 import pyqtgraph as pg
+import numpy as np
 
 from custom_widgets import DisplayWidget
 
@@ -36,7 +37,7 @@ class MonotonicTestWidget(QWidget):
         self.absolute_displacement_mm = 0.0
         self.displacement_offset_mm = 0.0
         self.current_test_data = []
-
+        self.current_resistance_ohm = -999.0 # Per memorizzare l'ultimo valore LCR
         # --- FONT E VALIDATORI ---
         general_font = QFont("Segoe UI", 11)
         button_font = QFont("Segoe UI", 10, QFont.Weight.Bold)
@@ -55,6 +56,8 @@ class MonotonicTestWidget(QWidget):
         self.abs_disp_display = DisplayWidget("Absolute Displacement (mm)")
         self.rel_disp_display = DisplayWidget("Relative Displacement (mm)")
         self.calib_status_display = DisplayWidget("Active Calibration")
+        self.resistance_display = DisplayWidget("Resistance (Ω)") # <-- ASSICURATI CHE QUESTA RIGA CI SIA
+        self.lcr_enable_checkbox = QCheckBox("Enable LCR Reading")
         
         locale_c = QLocale("C")  # forza separatore decimale con punto
 
@@ -80,7 +83,9 @@ class MonotonicTestWidget(QWidget):
         top_section_layout.addWidget(self.abs_disp_display)
         top_section_layout.addWidget(self.rel_disp_display)
         top_section_layout.addWidget(self.calib_status_display)
+        top_section_layout.addWidget(self.resistance_display)
         top_section_layout.addStretch(1)
+        jog_controls_layout.addWidget(self.lcr_enable_checkbox)
         top_section_layout.addLayout(jog_controls_layout)
 
         separator1 = QFrame()
@@ -172,6 +177,8 @@ class MonotonicTestWidget(QWidget):
 
         graph_layout = QVBoxLayout()
         self.plot_widget = pg.PlotWidget(); self.plot_widget.setBackground('w')
+
+
         self.plot_curve = self.plot_widget.plot(pen='b'); self.plot_widget.showGrid(x=True, y=True)
         graph_controls_layout = QHBoxLayout()
         self.x_axis_combo = QComboBox(); self.x_axis_combo.addItems(["Relative Displacement (mm)", "Strain (%)"])
@@ -214,7 +221,9 @@ class MonotonicTestWidget(QWidget):
         self.plot_curves = {}   # dict: specimen_name -> plot curve object
         self.plot_widget.addLegend()  # aggiunge la legenda
 
-
+        self.resistance_axis_viewbox = None # La ViewBox per la resistenza
+        self.resistance_axis_item = None    # L'AxisItem a destra
+        self.resistance_curve = None
 
 
 
@@ -264,6 +273,7 @@ class MonotonicTestWidget(QWidget):
         self.specimen_list.itemClicked.connect(self.on_specimen_selected)
         self.start_button.clicked.connect(self.on_start_test)
         self.finish_save_button.clicked.connect(self.on_finish_and_save)
+        self.lcr_enable_checkbox.stateChanged.connect(self._on_lcr_checkbox_changed)
        
         #self.stop_button.clicked.connect(self.on_stop_test)
         # collegamento di debug temporaneo
@@ -272,7 +282,6 @@ class MonotonicTestWidget(QWidget):
         self.stop_button.clicked.connect(lambda: print("DEBUG: click catturato"))
 
         self.limits_button.clicked.connect(self.limits_button_requested.emit)
-
 
         self.update_stop_criterion_options()
         self.update_displays()
@@ -356,7 +365,8 @@ class MonotonicTestWidget(QWidget):
             # Se la curva non esiste ancora (es. primo test), creala
             curve = self.plot_widget.plot([], [], pen=self.get_pen_for_specimen(self.current_specimen_name), name=self.current_specimen_name)
             self.plot_curves[self.current_specimen_name] = curve
-
+        if self.resistance_curve:
+            self.resistance_curve.setData([], [])
 
         # ✅ invio sempre valori convertiti e corretti per il firmware
         command = f"START_TEST:SPEED_MMS={speed_mms:.3f};CRITERION={criterion_str};STOP_VAL={stop_val_for_fw:.3f}"
@@ -412,19 +422,19 @@ class MonotonicTestWidget(QWidget):
         # Aggiorna il grafico in base al provino selezionato e all'overlay
         self.refresh_plot()    
 
-    def handle_stream_data(self, load_N, disp_mm, time_s, cycle_count):
+    def handle_stream_data(self, load_N, disp_mm, time_s, cycle_count, resistance_ohm):
         if not self.is_test_running:
             return
 
         # Aggiorna i valori assoluti con lo stream
         self.absolute_load_N = load_N
         self.absolute_displacement_mm = disp_mm
-
+        self.current_resistance_ohm = resistance_ohm
         relative_disp = disp_mm - self.displacement_offset_mm
         relative_load = load_N - self.load_offset_N
 
         # Salva la tupla a 5 elementi, con il tempo all'indice 0
-        self.current_test_data.append((time_s, relative_disp, relative_load, disp_mm, load_N))
+        self.current_test_data.append((time_s, relative_disp, relative_load, disp_mm, load_N, resistance_ohm))
 
         # Aggiorna la curva del grafico in tempo reale
         if self.current_specimen_name in self.plot_curves:
@@ -453,6 +463,17 @@ class MonotonicTestWidget(QWidget):
             self.plot_curves[self.current_specimen_name].setData(x_data_final, y_data_final)
             self.plot_widget.setLabel("bottom", x_mode)
             self.plot_widget.setLabel("left", y_mode)
+            if self.resistance_curve and self.lcr_enable_checkbox.isChecked():
+                try:
+                    # Estrai i dati di resistenza (indice 5)
+                    r_raw_data = [p[5] for p in self.current_test_data]
+                    # Applica il filtro per i valori negativi
+                    r_data_final = [r if r >= 0 else np.nan for r in r_raw_data]
+                    
+                    # Usa gli stessi dati X della curva principale
+                    self.resistance_curve.setData(x_data_final, r_data_final)
+                except Exception as e:
+                    print(f"Errore aggiornamento curva resistenza live (Mono): {e}")
         
         # Aggiorna i display numerici (i contatori)
         self.update_displays()
@@ -476,9 +497,6 @@ class MonotonicTestWidget(QWidget):
         ]
         for widget in widgets_to_toggle:
             widget.setEnabled(not is_running)
-
-
-
 
     # --- MOVIMENTO MANUALE ---
     def start_moving_up(self):
@@ -516,6 +534,21 @@ class MonotonicTestWidget(QWidget):
         else:
             self.abs_disp_display.set_value("Unhomed")
             self.rel_disp_display.set_value("--")
+
+        # --- NUOVA LOGICA PER DISPLAY RESISTENZA (copiata da cyclic) ---
+        res_value = self.current_resistance_ohm
+        if res_value <= -900.0: display_text = "N/A"
+        elif res_value == -1.0: display_text = "Timeout"
+        elif res_value == -2.0: display_text = "Parse Err"
+        elif res_value < 0: display_text = "ERR"
+        else:
+            if res_value > 1e6 or (res_value < 1e-3 and res_value != 0):
+                display_text = f"{res_value:.1e}"
+            else:
+                display_text = f"{res_value:.2f}"
+        #print(f"DEBUG GUI UpdateDisp ({type(self).__name__}): self.current_resistance_ohm = {self.current_resistance_ohm}, display_text = '{display_text}'")
+        #print(f"MONOTONIC DEBUG UpdateDisp: R_value={res_value}, Text='{display_text}'")
+        self.resistance_display.set_value(display_text)
 
     def update_stop_criterion_options(self):
         try:
@@ -809,20 +842,6 @@ class MonotonicTestWidget(QWidget):
     def send_command(self, command):
         self.communicator.send_command(command)
 
-    def start_moving_up(self): 
-        self.set_speed()
-        self.send_command("JOG_UP")
-
-    def start_moving_down(self): 
-        self.set_speed()
-        self.send_command("JOG_DOWN")
-
-    def stop_moving(self): 
-        self.send_command("STOP")
-    
-    def set_speed(self): 
-        self.send_command(f"SET_SPEED:{self.jog_speed_spinbox.value():.2f}")
-
     def zero_relative_load(self): 
         self.load_offset_N = self.absolute_load_N
         self.update_displays()
@@ -830,18 +849,6 @@ class MonotonicTestWidget(QWidget):
     def zero_relative_displacement(self): 
         self.displacement_offset_mm = self.absolute_displacement_mm
         self.update_displays()
-
-    def update_displays(self):
-        relative_load = self.absolute_load_N - self.load_offset_N
-        relative_disp = self.absolute_displacement_mm - self.displacement_offset_mm
-        self.abs_load_display.set_value(f"{self.absolute_load_N:.3f}")
-        self.rel_load_display.set_value(f"{relative_load:.3f}")
-        if self.is_homed:
-            self.abs_disp_display.set_value(f"{self.absolute_displacement_mm:.4f}")
-            self.rel_disp_display.set_value(f"{relative_disp:.4f}")
-        else:
-            self.abs_disp_display.set_value("Unhomed")
-            self.rel_disp_display.set_value("--")
 
     def update_stop_criterion_options(self):
         try:
@@ -855,63 +862,167 @@ class MonotonicTestWidget(QWidget):
             if not is_area_valid and self.stop_criterion_combo.currentText() == "Stress (MPa)":
                 self.stop_criterion_combo.setCurrentIndex(0)
 
-    def set_homing_status(self, is_homed):
-        self.is_homed = is_homed
-        self.update_displays() 
-
-    def set_calibration_status(self, status_text):
-        self.active_calibration_info = status_text
-        self.calib_status_display.set_value(status_text)
+# File: monotonic_test_widget.py
+# SOSTITUISCI l'intera funzione refresh_plot
 
     def refresh_plot(self):
-        self.plot_widget.clear()
-        self.plot_widget.addLegend()
-        self.plot_curves = {}
+        # --- 1. Pulisci il grafico ESISTENTE ---
+        plot_item = self.plot_widget.getPlotItem()
+        main_viewbox = plot_item.getViewBox()
 
+        # Rimuovi eventuali assi/viewbox secondari aggiunti in precedenza
+        if self.resistance_axis_viewbox:
+            try:
+                try:
+                    main_viewbox.sigResized.disconnect(self._update_resistance_views)
+                    main_viewbox.sigXRangeChanged.disconnect(self._update_resistance_views)
+                except (TypeError, RuntimeError):
+                    pass # Ignora se non erano connessi
+                
+                # Rimuovi la ViewBox dalla scena
+                plot_item.scene().removeItem(self.resistance_axis_viewbox)
+                self.resistance_axis_viewbox = None
+                # Scollega l'asse destro (non rimuoverlo)
+                plot_item.getAxis('right').linkToView(None)
+                # Nascondi l'asse destro
+                plot_item.showAxis('right', False)
+                self.resistance_curve = None # Azzera riferimento
+                
+                legend = plot_item.legend
+                if legend: legend.removeItem("Resistance") # Rimuovi dalla legenda
+            except Exception as e:
+                print(f"Errore rimozione asse/viewbox secondario (Mono): {e}")
+
+        # Pulisci le curve principali
+        self.plot_widget.clear() 
+        self.plot_widget.addLegend() # Ri-aggiungi la legenda pulita
+        self.plot_curves = {}        # Azzera dizionario curve salvate
+
+        # --- 2. Imposta Assi Principali ---
         x_mode = self.x_axis_combo.currentText()
         y_mode = self.y_axis_combo.currentText()
-        self.plot_widget.setLabel("bottom", x_mode)
-        self.plot_widget.setLabel("left", y_mode)
-
+        plot_item.setLabel("bottom", x_mode)
+        plot_item.setLabel("left", y_mode)
+        
+        # --- 3. Sotto-funzione convert_data (è corretta, resta invariata) ---
         def convert_data(specimen, raw_data):
             area = specimen.get("area", 1.0)
             gauge = specimen.get("gauge_length", 1.0)
-            x_raw = [p[1] for p in raw_data]
-            y_raw = [p[2] for p in raw_data]
+            if not raw_data: return [], [], []
+            try:
+                x_raw = [p[1] for p in raw_data] # rel_disp
+                y_raw = [p[2] for p in raw_data] # rel_load
+                r_raw = [p[5] for p in raw_data] # resistance
+            except (IndexError, TypeError) as e:
+                print(f"Errore estrazione dati in convert_data (monotonico): {e}")
+                return [], [], []
+            if "Strain" in x_mode and gauge > 0: x = [(d / gauge) * 100 for d in x_raw]
+            else: x = x_raw 
+            if "Stress" in y_mode and area > 0: y = [(f / area) for f in y_raw]
+            else: y = y_raw 
+            r_data = [r if r >= 0 else np.nan for r in r_raw]
+            return x, y, r_data
 
-            if "Strain" in x_mode:
-                x = [(d / gauge) * 100 for d in x_raw]
-            else:
-                x = x_raw
-
-            if "Stress" in y_mode:
-                y = [(f / area) for f in y_raw]
-            else:
-                y = y_raw
-
-            return x, y
-
-        if self.overlay_checkbox.isChecked():
+        # --- 4. Logica Overlay/Disegno Curve Principali (resta invariata) ---
+        show_overlay = self.overlay_checkbox.isChecked()
+        if show_overlay:
             for name, specimen in self.specimens.items():
                 if specimen.get("test_data") and specimen.get("visible", True):
-                    x, y = convert_data(specimen, specimen["test_data"])
-                    curve = self.plot_widget.plot(x, y, pen=self.get_pen_for_specimen(name), name=name)
-                    self.plot_curves[name] = curve
+                    try:
+                        x, y, _ = convert_data(specimen, specimen["test_data"])
+                        curve = self.plot_widget.plot(x, y, pen=self.get_pen_for_specimen(name), name=name)
+                        self.plot_curves[name] = curve
+                    except Exception as e: print(f"Errore disegno overlay {name} (Mono): {e}")
         else:
             if self.current_specimen_name:
-                specimen = self.specimens[self.current_specimen_name]
-                if specimen.get("test_data"):
-                    x, y = convert_data(specimen, specimen["test_data"])
-                    curve = self.plot_widget.plot(x, y, pen=self.get_pen_for_specimen(self.current_specimen_name), name=self.current_specimen_name)
-                    self.plot_curves[self.current_specimen_name] = curve
+                specimen = self.specimens.get(self.current_specimen_name)
+                if specimen and specimen.get("test_data"):
+                    try:
+                        x, y, _ = convert_data(specimen, specimen["test_data"])
+                        curve = self.plot_widget.plot(x, y, pen=self.get_pen_for_specimen(self.current_specimen_name), name=self.current_specimen_name)
+                        self.plot_curves[self.current_specimen_name] = curve
+                    except Exception as e: print(f"Errore disegno non-overlay {self.current_specimen_name} (Mono): {e}")
 
-        # Se c’è un test in corso, aggiorna anche la curva live
-        if self.is_test_running and self.current_specimen_name:
-            if self.current_specimen_name not in self.plot_curves:
-                curve = self.plot_widget.plot([], [], pen=self.get_pen_for_specimen(self.current_specimen_name), name=self.current_specimen_name)
-                self.plot_curves[self.current_specimen_name] = curve
+        # --- 5. Logica Secondo Asse Y (Resistenza) ---
+        lcr_enabled = self.lcr_enable_checkbox.isChecked()
 
+        if lcr_enabled:
+            try:
+                # 1. CREA E MOSTRA L'ASSE DESTRO (gestito dal layout)
+                plot_item.showAxis('right')
+                
+                # 2. Crea la ViewBox secondaria
+                self.resistance_axis_viewbox = pg.ViewBox()
+                self.resistance_axis_viewbox.setZValue(10)
 
+                # 3. COLLEGA l'asse alla ViewBox
+                plot_item.getAxis('right').linkToView(self.resistance_axis_viewbox)
+                plot_item.getAxis('right').setLabel('Resistance', units='Ω')
+
+                # 4. Aggiungi la ViewBox alla SCENA
+                plot_item.scene().addItem(self.resistance_axis_viewbox)
+
+                # 5. Linka l'asse X (scorrimento e zoom)
+                self.resistance_axis_viewbox.linkView(pg.ViewBox.XAxis, main_viewbox)
+
+                # 6. Crea la curva per la resistenza
+                resistance_pen = pg.mkPen('orange', width=2, style=Qt.PenStyle.DotLine)
+                # Questa self.resistance_curve sarà usata per il LIVE STREAMING
+                self.resistance_curve = pg.PlotDataItem(pen=resistance_pen, name="Resistance")
+                
+                # 7. Aggiungi la curva alla ViewBox secondaria
+                self.resistance_axis_viewbox.addItem(self.resistance_curve)
+
+                # 8. Sincronizza le viste (fondamentale)
+                main_viewbox.sigResized.connect(self._update_resistance_views)
+                main_viewbox.sigXRangeChanged.connect(self._update_resistance_views)
+                self._update_resistance_views() # Chiama subito
+
+                # 9. Disegna i dati di resistenza ESISTENTI (Polling)
+                if show_overlay:
+                     for name, specimen in self.specimens.items():
+                        if specimen.get("test_data") and specimen.get("visible", True):
+                            try:
+                                x, _, r_data = convert_data(specimen, specimen["test_data"])
+                                # Crea una NUOVA curva (NON self.resistance_curve)
+                                overlay_res_curve = pg.PlotDataItem(pen=pg.mkPen('orange', width=1, style=Qt.PenStyle.DotLine))
+                                self.resistance_axis_viewbox.addItem(overlay_res_curve)
+                                overlay_res_curve.setData(x, r_data)
+                            except Exception as e: print(f"Errore disegno overlay resistenza {name} (Mono): {e}")
+                else: # Non overlay
+                    if self.current_specimen_name:
+                        specimen = self.specimens.get(self.current_specimen_name)
+                        if specimen and specimen.get("test_data"):
+                            try:
+                                x, _, r_data = convert_data(specimen, specimen["test_data"])
+                                # Usa la curva self.resistance_curve per i dati salvati
+                                self.resistance_curve.setData(x, r_data)
+                            except Exception as e: print(f"Errore disegno non-overlay resistenza {self.current_specimen_name} (Mono): {e}")
+            
+            except Exception as e:
+                print(f"Errore creazione asse resistenza (Mono - refresh_plot): {e}")
+
+        # --- 6. Grafico Live (Questa sezione è confusa e la semplifichiamo) ---
+        # La logica di aggiornamento live è gestita da handle_stream_data.
+        # Dobbiamo solo assicurare che le curve esistano se il test è in corso.
+        
+        if self.is_test_running and self.current_test_data:
+            try:
+                specimen = self.specimens.get(self.current_specimen_name, {"gauge_length": 1.0, "area": 1.0})
+                x_live, y_live, r_live = convert_data(specimen, self.current_test_data)
+                
+                # Aggiorna curva live principale
+                main_live_curve = self.plot_curves.get(self.current_specimen_name)
+                if not main_live_curve: # Se non esiste (strano, ma per sicurezza)
+                     main_live_curve = self.plot_widget.plot([], [], pen=self.get_pen_for_specimen(self.current_specimen_name), name=self.current_specimen_name)
+                     self.plot_curves[self.current_specimen_name] = main_live_curve
+                main_live_curve.setData(x_live, y_live)
+                 
+                # Aggiorna curva live resistenza (SOLO SE ESISTE)
+                if self.resistance_curve:
+                    self.resistance_curve.setData(x_live, r_live)
+            except Exception as e:
+                print(f"Errore aggiornamento dati live (Mono - refresh_plot): {e}")
 
     def on_overlay_item_changed(self, item):
         name = item.text()
@@ -977,3 +1088,32 @@ class MonotonicTestWidget(QWidget):
                 QMessageBox.information(self, "Successo", message)
             else:
                 QMessageBox.critical(self, "Errore", message)
+
+
+    def _on_lcr_checkbox_changed(self, state):
+        """ Invia il comando appropriato all'ESP32 quando il checkbox cambia stato. """
+        if state == Qt.CheckState.Checked.value:
+            print("DEBUG GUI (Mono): Abilitazione LCR Polling")
+            self.send_command("ENABLE_LCR_POLLING") # Usa self.send_command
+        else:
+            print("DEBUG GUI (Mono): Disabilitazione LCR Polling")
+            self.send_command("DISABLE_LCR_POLLING") # Usa self.send_command
+            # Resetta subito il display a "N/A" o "--"
+            self.current_resistance_ohm = -999.0
+        self.refresh_plot()
+        self.update_displays() # Aggiorna per mostrare il reset
+
+
+
+    def _update_resistance_views(self):
+        """ Funzione helper per sincronizzare i ViewBox principale e secondario. """
+        main_viewbox = self.plot_widget.getViewBox()
+        if self.resistance_axis_viewbox and main_viewbox:
+            try:
+                # Questo codice è lo stesso che era dentro 'update_views'
+                self.resistance_axis_viewbox.setGeometry(main_viewbox.sceneBoundingRect())
+                self.resistance_axis_viewbox.linkedViewChanged(main_viewbox, pg.ViewBox.XAxis)
+                self.resistance_axis_viewbox.enableAutoRange(axis=pg.ViewBox.YAxis)
+            except Exception as e:
+                # Può fallire in modo innocuo se un oggetto è in fase di distruzione
+                pass

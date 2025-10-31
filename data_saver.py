@@ -92,6 +92,9 @@ class DataSaver:
             "Strain (%)", "Stress (MPa)",
             "Absolute Displacement (mm)", "Absolute Load (N)"
         ]
+
+        headers.append("Resistance (Ohm)")
+
         if is_cyclic:
             headers.extend(["Cycle", "Block"])
         sheet.append(headers)
@@ -101,13 +104,24 @@ class DataSaver:
         gauge = specimen_data.get("gauge_length")
 
         for i, data_row in enumerate(test_data):
-            is_gauge_valid = isinstance(gauge, (int, float)) and not np.isnan(gauge) and gauge > 0
-            is_area_valid = isinstance(area, (int, float)) and not np.isnan(area) and area > 0
+            resistance = np.nan
+            cycle = np.nan
+            block = np.nan
+            time_s, rel_disp, rel_load, abs_disp, abs_load = data_row[:5]
 
             if is_cyclic:
-                (time_s, rel_disp, rel_load, abs_disp, abs_load, cycle, block) = data_row
-            else:
-                (time_s, rel_disp, rel_load, abs_disp, abs_load) = data_row
+                # Tupla ciclica: (... cycle, block, resistance) - 8 elementi
+                if len(data_row) == 8: # <-- CONTROLLA LUNGHEZZA
+                    cycle = data_row[5]
+                    block = data_row[6]
+                    resistance = data_row[7] # <-- ESTRAE RESISTENZA DALL'INDICE 7
+            else: # Monotonico
+                # Tupla monotonica: (... resistance) - 6 elementi
+                if len(data_row) == 6: # <-- CONTROLLA LUNGHEZZA
+                    resistance = data_row[5] # <-- ESTRAE RESISTENZA DALL'INDICE 5
+
+            is_gauge_valid = isinstance(gauge, (int, float)) and not np.isnan(gauge) and gauge > 0
+            is_area_valid = isinstance(area, (int, float)) and not np.isnan(area) and area > 0
 
             strain = (rel_disp / gauge) * 100 if is_gauge_valid else np.nan
             stress = rel_load / area if is_area_valid else np.nan
@@ -120,10 +134,10 @@ class DataSaver:
             sheet.cell(row=current_excel_row, column=5, value=stress)
             sheet.cell(row=current_excel_row, column=6, value=abs_disp)
             sheet.cell(row=current_excel_row, column=7, value=abs_load)
-
+            sheet.cell(row=current_excel_row, column=8, value=resistance)
             if is_cyclic:
-                sheet.cell(row=current_excel_row, column=8, value=cycle)
-                sheet.cell(row=current_excel_row, column=9, value=block)
+                sheet.cell(row=current_excel_row, column=9, value=cycle)
+                sheet.cell(row=current_excel_row, column=10, value=block)
 
         num_data_points = len(test_data)
         if num_data_points == 0:

@@ -1,4 +1,4 @@
-from PyQt6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel, QDoubleSpinBox, QGridLayout, QFileDialog, QMessageBox
+from PyQt6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel, QDoubleSpinBox, QGridLayout, QFileDialog, QMessageBox, QCheckBox
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QFont
 
@@ -32,10 +32,15 @@ class ManualControlWidget(QWidget):
         self.plot_force_data = deque(maxlen=num_points)
         self.plot_start_time = 0
         # --- FINE NUOVE VARIABILI ---
+        self.plot_time_data = deque(maxlen=num_points)
+        self.plot_force_data = deque(maxlen=num_points)
+        self.plot_resistance_data = deque(maxlen=num_points)
+
 
         self.MIN_SPEED, self.MAX_SPEED = 0.01, 25.0
         self.is_homed = False; self.absolute_load_N = 0.0; self.load_offset_N = 0.0
         self.absolute_displacement_mm = 0.0; self.displacement_offset_mm = 0.0
+        self.current_resistance_ohm = -999.0 # Per memorizzare l'ultimo valore LCR
 
         general_font = QFont("Segoe UI", 12); button_font = QFont("Segoe UI", 12, QFont.Weight.Bold)
         minmax_font = QFont("Segoe UI", 8)
@@ -46,6 +51,7 @@ class ManualControlWidget(QWidget):
         self.rel_disp_display = DisplayWidget("Relative Displacement (mm)")
         self.calib_status_display = DisplayWidget("Active Calibration")
         self.calib_status_display.set_value("Not Calibrated")
+        self.resistance_display = DisplayWidget("Resistance (Ω)")
 
         self.up_button = QPushButton("↑ UP ↑"); self.down_button = QPushButton("↓ DOWN ↓")
         
@@ -70,6 +76,10 @@ class ManualControlWidget(QWidget):
         self.plot_widget.setLabel('left', 'Load (N)')
         self.plot_widget.setLabel('bottom', 'Time (s)')
         self.plot_curve = self.plot_widget.plot(pen='b')
+
+        self.resistance_axis_viewbox = None # La ViewBox per la resistenza
+        self.resistance_axis_item = None    # L'AxisItem a destra
+        self.resistance_curve = None
 
         self.time_window_spinbox = QDoubleSpinBox()
         self.time_window_spinbox.setSuffix(" s")
@@ -103,6 +113,7 @@ class ManualControlWidget(QWidget):
         display_layout = QHBoxLayout(); display_layout.addWidget(self.abs_load_display)
         display_layout.addWidget(self.rel_load_display); display_layout.addWidget(self.abs_disp_display)
         display_layout.addWidget(self.rel_disp_display)
+        display_layout.addWidget(self.resistance_display)
         left_vbox = QVBoxLayout(); speed_label_title = QLabel("Jog Speed:"); speed_label_title.setFont(general_font)
         left_vbox.addWidget(self.up_button); left_vbox.addWidget(self.down_button); left_vbox.addSpacing(20)
         left_vbox.addWidget(speed_label_title); left_vbox.addWidget(self.speed_spinbox); left_vbox.addWidget(self.speed_bar)
@@ -128,6 +139,10 @@ class ManualControlWidget(QWidget):
         
         # Aggiungi il nuovo layout al layout principale
         main_layout.addLayout(graph_section_layout, 1, 0, 1, 2)
+
+        self.lcr_enable_checkbox = QCheckBox("Enable LCR Reading")
+        functions_layout.addWidget(self.lcr_enable_checkbox)
+
         # --- FINE NUOVO LAYOUT --
 
         main_layout.addLayout(left_vbox, 2, 0)
@@ -146,14 +161,17 @@ class ManualControlWidget(QWidget):
         self.rec_button.clicked.connect(self.on_rec_button_clicked)
         self.time_window_spinbox.valueChanged.connect(self.on_time_window_changed)
         self.plot_update_timer.timeout.connect(self._update_plot)
+        self.lcr_enable_checkbox.stateChanged.connect(self._on_lcr_checkbox_changed)
+        self._setup_resistance_axis()
         # --- FINE ---
         self.update_displays(); self.update_speed_controls()
 
-    def handle_stream_data(self, load_N, disp_mm, time_s, cycle_count):
+    def handle_stream_data(self, load_N, disp_mm, time_s, cycle_count, resistance_ohm):
              # Se la schermata non è visibile, non fare nulla
         if not self.isVisible():
             self.plot_start_time = 0 # Resetta il tempo se la schermata viene nascosta
             return
+        self.current_resistance_ohm = resistance_ohm
 
         # Inizializza il tempo di partenza al primo dato ricevuto
         if self.plot_start_time == 0:
@@ -161,22 +179,30 @@ class ManualControlWidget(QWidget):
             # Pulisci i dati vecchi all'inizio di una nuova visualizzazione
             self.plot_time_data.clear()
             self.plot_force_data.clear()
+            self.plot_resistance_data.clear()
 
         elapsed_time = time.time() - self.plot_start_time
-        
+        self.current_resistance_ohm = resistance_ohm
+    
         self.plot_time_data.append(elapsed_time)
         self.plot_force_data.append(load_N)
+        self.plot_resistance_data.append(resistance_ohm if resistance_ohm >= 0 else np.nan)
 
         # Se la registrazione è attiva, salva tutti i dati
         if self.is_recording:
             relative_disp = disp_mm - self.displacement_offset_mm
             relative_load = load_N - self.load_offset_N
-            self.recorded_data.append((elapsed_time, relative_disp, relative_load, disp_mm, load_N))
+            self.recorded_data.append((elapsed_time, relative_disp, relative_load, disp_mm, load_N, resistance_ohm))
 
     # Aggiungi questo nuovo metodo privato alla classe
     def _update_plot(self):
         self.plot_curve.setData(list(self.plot_time_data), list(self.plot_force_data))
-        
+        if self.resistance_curve: # Controlla se il secondo asse è attivo
+            try:
+                # Usa gli stessi dati temporali e i dati di resistenza salvati
+                self.resistance_curve.setData(list(self.plot_time_data), list(self.plot_resistance_data))
+            except Exception as e:
+                print(f"Errore aggiornamento curva resistenza (Manual): {e}") # Debug 
         # Calcola dinamicamente la finestra di visualizzazione per l'effetto "scorrimento"
         if self.plot_time_data:
             # Prendi il tempo dell'ultimo dato arrivato
@@ -271,9 +297,13 @@ class ManualControlWidget(QWidget):
     def on_time_window_changed(self, value):
         self.time_window_seconds = value
         num_points = int(self.time_window_seconds * 50)
+        current_time_list = list(self.plot_time_data) # Salva i dati correnti
+        current_force_list = list(self.plot_force_data)
+        current_res_list = list(self.plot_resistance_data)
         # Crea delle liste NUOVE e VUOTE con la nuova lunghezza massima
-        self.plot_time_data = deque(maxlen=num_points)
-        self.plot_force_data = deque(maxlen=num_points)
+        self.plot_time_data = deque(current_time_list, maxlen=num_points) # Ricrea con maxlen
+        self.plot_force_data = deque(current_force_list, maxlen=num_points)
+        self.plot_resistance_data = deque(current_res_list, maxlen=num_points) # <-- MODIFICA QUI
 
     def set_calibration_status(self, status_text):
         self.calib_status_display.set_value(status_text)
@@ -330,5 +360,136 @@ class ManualControlWidget(QWidget):
         else:
             self.abs_disp_display.set_value("Unhomed")
             self.rel_disp_display.set_value("--")
+        res_value = self.current_resistance_ohm
+        if res_value <= -900.0: display_text = "N/A"
+        elif res_value == -1.0: display_text = "Timeout"
+        elif res_value == -2.0: display_text = "Parse Err"
+        elif res_value < 0: display_text = "ERR"
+        else:
+            if res_value > 1e6 or (res_value < 1e-3 and res_value != 0):
+                display_text = f"{res_value:.3e}"
+            else:
+                display_text = f"{res_value:.4f}"
+        #print(f"DEBUG GUI UpdateDisp ({type(self).__name__}): self.current_resistance_ohm = {self.current_resistance_ohm}, display_text = '{display_text}'")
+        self.resistance_display.set_value(display_text)
+
+    def _on_lcr_checkbox_changed(self, state):
+        """ Invia il comando appropriato all'ESP32 quando il checkbox cambia stato. """
+        if state == Qt.CheckState.Checked.value:
+            #print("DEBUG GUI (Manual): Abilitazione LCR Polling")
+            self.send_command("ENABLE_LCR_POLLING")
+        else:
+            #print("DEBUG GUI (Manual): Disabilitazione LCR Polling")
+            self.send_command("DISABLE_LCR_POLLING")
+            # Resetta subito il display
+            self.current_resistance_ohm = -999.0
+        self._setup_resistance_axis()
+        self.update_displays()
 
 
+    def _setup_resistance_axis(self):
+        """ Crea o rimuove il secondo asse Y per la resistenza (Versione Robusta). """
+        
+        # --- BLOCCO DI SICUREZZA INIZIALE ---
+        try:
+            plot_item = self.plot_widget.getPlotItem()
+            if not plot_item:
+                return # Esce subito se il plot_item non esiste
+            main_viewbox = plot_item.getViewBox()
+            if not main_viewbox:
+                return # Esce subito se la viewbox non esiste
+        except Exception as e:
+            print(f"Errore critico in _setup_resistance_axis (init): {e}")
+            return
+        # --- FINE BLOCCO DI SICUREZZA ---
+
+        lcr_enabled = self.lcr_enable_checkbox.isChecked()
+
+        # --- Rimuovi elementi esistenti ---
+        if self.resistance_axis_viewbox:
+            try:
+                # --- 1. SCOLLEGA I SEGNALI (in modo sicuro) ---
+                try:
+                    # main_viewbox è valido grazie al blocco sopra
+                    main_viewbox.sigResized.disconnect(self._update_resistance_views)
+                    main_viewbox.sigXRangeChanged.disconnect(self._update_resistance_views)
+                except Exception:
+                    pass # Ignora se non connesso
+
+                # --- 2. DISTRUGGI OGGETTI (in modo sicuro) ---
+                self.resistance_curve = None # Evita race condition
+                
+                scene = plot_item.scene()
+                if scene and self.resistance_axis_viewbox:
+                    scene.removeItem(self.resistance_axis_viewbox)
+                self.resistance_axis_viewbox = None
+                
+                axis = plot_item.getAxis('right')
+                if axis:
+                    axis.linkToView(None) 
+                
+                plot_item.showAxis('right', False)
+                
+                try:
+                    if plot_item.legend:
+                        plot_item.legend.removeItem("Resistance")
+                except Exception:
+                    pass
+            except Exception as e:
+                # Questo ora non dovrebbe più accadere
+                print(f"Errore rimozione asse resistenza esistente (Manual): {e}")
+
+        # --- Crea nuovi elementi ---
+        if lcr_enabled:
+            try:
+                plot_item.showAxis('right')
+                self.resistance_axis_viewbox = pg.ViewBox()
+                self.resistance_axis_viewbox.setZValue(10)
+                
+                axis = plot_item.getAxis('right')
+                if axis:
+                    axis.linkToView(self.resistance_axis_viewbox)
+                    axis.setLabel('Resistance', units='Ω')
+                
+                scene = plot_item.scene()
+                if scene:
+                    scene.addItem(self.resistance_axis_viewbox)
+
+                self.resistance_axis_viewbox.linkView(pg.ViewBox.XAxis, main_viewbox)
+
+                resistance_pen = pg.mkPen('orange', width=2, style=Qt.PenStyle.DotLine)
+                self.resistance_curve = pg.PlotDataItem(pen=resistance_pen, name="Resistance")
+                self.resistance_axis_viewbox.addItem(self.resistance_curve)
+
+                # Collega al metodo della classe
+                main_viewbox.sigResized.connect(self._update_resistance_views)
+                main_viewbox.sigXRangeChanged.connect(self._update_resistance_views)
+                self._update_resistance_views() # Chiama subito
+
+                self.plot_time_data.clear()
+                self.plot_force_data.clear()
+                self.plot_resistance_data.clear()
+
+            except Exception as e:
+                 print(f"Errore creazione asse resistenza (Manual): {e}")
+
+
+    def _update_resistance_views(self):
+        """ Funzione helper per sincronizzare i ViewBox principale e secondario. """
+        main_viewbox = self.plot_widget.getViewBox()
+        if self.resistance_axis_viewbox and main_viewbox:
+            try:
+                # 1. Allinea le aree di disegno
+                self.resistance_axis_viewbox.setGeometry(main_viewbox.sceneBoundingRect())
+                # 2. Sincronizza l'asse X
+                self.resistance_axis_viewbox.linkedViewChanged(main_viewbox, pg.ViewBox.XAxis)
+                # 3. Autoscala l'asse Y secondario
+                self.resistance_axis_viewbox.enableAutoRange(axis=pg.ViewBox.YAxis)
+                
+                # Fix per l'asse che non compare in polling
+                yrange = self.resistance_axis_viewbox.viewRange()[1]
+                if yrange[0] == 0 and yrange[1] == 1:
+                    self.resistance_axis_viewbox.setYRange(0, 1000) # Imposta un range visibile
+            except Exception as e:
+                pass
+        

@@ -136,221 +136,229 @@ class MainWindow(QMainWindow):
         self.refresh_ports_button.setEnabled(True); self.port_selector.setEnabled(True)
         self.statusBar().showMessage("Disconnesso.")
 
+    # File: main.py
+    # SOSTITUISCI completamente la vecchia funzione handle_data_from_esp32 con questa
+
     def handle_data_from_esp32(self, data: str):
-        print(f"[ESP32 RAW]: {data}")
-        
-        # --- BLOCCO UNICO PER LA GESTIONE DEI MESSAGGI ---
-        
-        # Se è un messaggio di STATO, gestiscilo e termina.
+        print(f"[ESP32 RAW]: {data}") # Stampa dati grezzi
+
+        # --- GESTIONE MESSAGGI DI STATO ---
         if data.startswith("STATUS:"):
             status_message = data.replace("STATUS:", "")
-            self.statusBar().showMessage(f"Status: {status_message}", 5000)
-            # --- GESTIONE MESSAGGI CICLICI ---
+            self.statusBar().showMessage(f"Status: {status_message}", 5000) # Mostra nella status bar
+
+            # Gestione specifica dei messaggi di stato
+            widget = self.cyclic_test # Riferimento al widget ciclico (usato sotto)
+
             if "CYCLIC_TEST_STARTED" in status_message or "CYCLIC_PREPOSITIONING" in status_message:
-                # La UI è già stata aggiornata da on_start_test
-                pass # Non fare nulla di speciale qui
-            
+                pass # UI già aggiornata da on_start_test
+
             elif "BLOCK_COMPLETED" in status_message:
-                widget = self.cyclic_test # Riferimento al widget ciclico
-                widget.current_block_index += 1 # Passa al blocco successivo
+                # Questa logica è specifica per il test ciclico
+                # Controlla se il widget corrente è quello ciclico prima di procedere
+                if self.stacked_widget.currentWidget() == widget and widget.is_test_running:
+                    widget.current_block_index += 1 # Passa al blocco successivo
 
-                if widget.current_block_index < len(widget.test_sequence):
-                    # C'è un altro blocco, invia il comando
-                    next_block = widget.test_sequence[widget.current_block_index]
+                    if widget.current_block_index < len(widget.test_sequence):
+                        # C'è un altro blocco, invia il comando appropriato
+                        next_block = widget.test_sequence[widget.current_block_index]
+                        command = "" # Inizializza comando
 
-                    if next_block["type"] == "cyclic":
-                        # --- BLOCCO CICLICO (invariato) ---
-                        control_mode_base = next_block["base_unit"].upper()
-                        if control_mode_base == "MM":
-                            control_mode_fw = "DISP"
-                            abs_upper_mm = next_block["upper_conv"] + widget.displacement_offset_mm
-                            abs_lower_mm = next_block["lower_conv"] + widget.displacement_offset_mm
-                            upper_fw = abs_upper_mm; lower_fw = abs_lower_mm
-                        else: # "N"
-                            control_mode_fw = "FORCE"
-                            abs_upper_N = next_block["upper_conv"] + widget.load_offset_N
-                            abs_lower_N = next_block["lower_conv"] + widget.load_offset_N
-                            upper_fw = (abs_upper_N / 9.81) * 1000.0
-                            lower_fw = (abs_lower_N / 9.81) * 1000.0
-                        speed_mms = next_block["speed_mms"]
-                        hold_upper_ms = int(next_block["hold_upper"] * 1000)
-                        hold_lower_ms = int(next_block["hold_lower"] * 1000)
-                        cycles = next_block["cycles"]
-                        command = (f"START_CYCLIC_TEST:"
-                                   f"MODE={control_mode_fw};UPPER={upper_fw:.4f};LOWER={lower_fw:.4f};"
-                                   f"SPEED={speed_mms:.3f};HOLD_U={hold_upper_ms};HOLD_L={hold_lower_ms};CYCLES={cycles}")
-                        self.communicator.send_command(command)
-                        print(f"DEBUG Main: Avviato Blocco Ciclico {widget.current_block_index + 1}")
+                        if next_block["type"] == "cyclic":
+                            # --- ECCO LA LOGICA COMPLETA PER 'cyclic' ---
+                            control_mode_base = next_block["base_unit"].upper() # "MM" o "N"
+                            if control_mode_base == "MM":
+                                control_mode_fw = "DISP"
+                                abs_upper_mm = next_block["upper_conv"] + widget.displacement_offset_mm
+                                abs_lower_mm = next_block["lower_conv"] + widget.displacement_offset_mm
+                                upper_fw = abs_upper_mm
+                                lower_fw = abs_lower_mm
+                            else: # "N"
+                                control_mode_fw = "FORCE"
+                                abs_upper_N = next_block["upper_conv"] + widget.load_offset_N
+                                abs_lower_N = next_block["lower_conv"] + widget.load_offset_N
+                                upper_fw = (abs_upper_N / 9.81) * 1000.0
+                                lower_fw = (abs_lower_N / 9.81) * 1000.0
+                            
+                            speed_mms = next_block["speed_mms"]
+                            hold_upper_ms = int(next_block["hold_upper"] * 1000)
+                            hold_lower_ms = int(next_block["hold_lower"] * 1000)
+                            cycles = next_block["cycles"]
+                            
+                            command = (f"START_CYCLIC_TEST:"
+                                       f"MODE={control_mode_fw};UPPER={upper_fw:.4f};LOWER={lower_fw:.4f};"
+                                       f"SPEED={speed_mms:.3f};HOLD_U={hold_upper_ms};HOLD_L={hold_lower_ms};CYCLES={cycles}")
+                            print(f"DEBUG Main: Avviato Blocco Ciclico {widget.current_block_index + 1}")
+                            # --- FINE LOGICA 'cyclic' ---
 
-                    elif next_block["type"] == "pause":
-                        # --- BLOCCO PAUSA (invariato) ---
-                        duration_ms = int(next_block["duration"] * 1000)
-                        command = f"EXECUTE_PAUSE:{duration_ms}"
-                        self.communicator.send_command(command)
-                        print(f"DEBUG Main: Avviata Pausa {widget.current_block_index + 1} ({duration_ms} ms)")
+                        elif next_block["type"] == "pause":
+                            # --- ECCO LA LOGICA COMPLETA PER 'pause' ---
+                            duration_ms = int(next_block["duration"] * 1000)
+                            command = f"EXECUTE_PAUSE:{duration_ms}"
+                            print(f"DEBUG Main: Avviata Pausa {widget.current_block_index + 1} ({duration_ms} ms)")
+                            # --- FINE LOGICA 'pause' ---
 
-                    # --- NUOVO BLOCCO PER GESTIRE LA RAMPA ---
-                    elif next_block["type"] == "ramp":
-                        control_mode_base = next_block["base_unit"].upper() # Sarà "MM" o "N"
-                        if control_mode_base == "MM":
-                            control_mode_fw = "DISP"
-                            abs_target_mm = next_block["target_conv"] + widget.displacement_offset_mm
-                            target_fw = abs_target_mm # Il firmware si aspetta mm
-                        else: # "N"
-                            control_mode_fw = "FORCE"
-                            abs_target_N = next_block["target_conv"] + widget.load_offset_N
-                            target_fw = (abs_target_N / 9.81) * 1000.0 # Converti N assoluti in grammi
+                        elif next_block["type"] == "ramp":
+                            # --- ECCO LA LOGICA COMPLETA PER 'ramp' ---
+                            control_mode_base = next_block["base_unit"].upper() # Sarà "MM" o "N"
+                            if control_mode_base == "MM":
+                                control_mode_fw = "DISP"
+                                abs_target_mm = next_block["target_conv"] + widget.displacement_offset_mm
+                                target_fw = abs_target_mm # Il firmware si aspetta mm
+                            else: # "N"
+                                control_mode_fw = "FORCE"
+                                abs_target_N = next_block["target_conv"] + widget.load_offset_N
+                                target_fw = (abs_target_N / 9.81) * 1000.0 # Converti N assoluti in grammi
 
-                        speed_mms = next_block["speed_mms"]
-                        hold_ms = int(next_block["hold_duration"] * 1000)
+                            speed_mms = next_block["speed_mms"]
+                            hold_ms = int(next_block["hold_duration"] * 1000)
 
-                        # Costruisci il nuovo comando per il firmware
-                        command = (f"EXECUTE_RAMP:"
-                                   f"MODE={control_mode_fw};" # DISP o FORCE
-                                   f"TARGET={target_fw:.4f};" # mm o grammi ASSOLUTI
-                                   f"SPEED={speed_mms:.3f};"
-                                   f"HOLD={hold_ms}")
-                        self.communicator.send_command(command)
-                        print(f"DEBUG Main: Avviata Rampa {widget.current_block_index + 1}")
-                    # --- FINE NUOVO BLOCCO RAMPA ---
-                else:
-                     # --- INIZIO CORREZIONE ---
-                     # Non ci sono altri blocchi. La sequenza è completata.
-                     # Chiama manualmente la funzione di stop della UI.
-                     print(f"DEBUG Main: Sequenza completata. Tutti i {widget.current_block_index} blocchi eseguiti.")
-                     self.communicator.send_command("SET_MODE:POLLING")
-                     if self.cyclic_test.is_test_running:
-                         self.cyclic_test.on_stop_test(user_initiated=False)
-                         QMessageBox.information(self, "Test Ciclico Terminato", "Sequenza di test completata.")
-                     # --- FINE CORREZIONE ---
+                            command = (f"EXECUTE_RAMP:"
+                                       f"MODE={control_mode_fw};" 
+                                       f"TARGET={target_fw:.4f};"
+                                       f"SPEED={speed_mms:.3f};"
+                                       f"HOLD={hold_ms}")
+                            print(f"DEBUG Main: Avviata Rampa {widget.current_block_index + 1}")
+                            # --- FINE LOGICA 'ramp' ---
 
+                        if command:
+                             self.communicator.send_command(command) # Invia comando del blocco successivo
 
+                    else:
+                        # Non ci sono altri blocchi. Sequenza completata.
+                        print(f"DEBUG Main: Sequenza completata. Tutti i {widget.current_block_index} blocchi eseguiti.")
+                        self.communicator.send_command("SET_MODE:POLLING") # Torna in polling
+                        if widget.is_test_running:
+                            widget.on_stop_test(user_initiated=False) # Aggiorna UI
+                            QMessageBox.information(self, "Test Ciclico Terminato", "Sequenza di test completata.")
+                # Se non siamo nel widget ciclico, ignoriamo BLOCK_COMPLETED
+                # (potrebbe arrivare da un test precedente interrotto?)
+
+            # Gestione fine test ciclico (completato, stoppato, endstop)
             elif "CYCLIC_TEST_COMPLETED" in status_message or \
                  ("CYCLIC_TEST_STOPPED_BY_USER" in status_message and self.cyclic_test.is_test_running) or \
                  ("TOP_HIT" in status_message and self.cyclic_test.is_test_running) or \
                  ("BOTTOM_HIT" in status_message and self.cyclic_test.is_test_running):
-                 
-                 # Il test è finito (completato, stoppato, o endstop colpito), aggiorna la UI
                  if self.cyclic_test.is_test_running:
                      self.cyclic_test.on_stop_test(user_initiated=False)
-                     # Mostra un popup diverso se è un endstop
+                     popup_title = "Test Ciclico Terminato"
+                     popup_message = f"Il test si è concluso con stato: {status_message}"
                      if "TOP_HIT" in status_message or "BOTTOM_HIT" in status_message:
-                         QMessageBox.critical(self, "Endstop Colpito", f"Test interrotto: {status_message}")
+                         popup_title = "Endstop Colpito"
+                         popup_message = f"Test interrotto: {status_message}"
+                         QMessageBox.critical(self, popup_title, popup_message)
                      else:
-                         QMessageBox.information(self, "Test Ciclico Terminato", f"Il test si è concluso con stato: {status_message}")
-            # Gestione Limiti di Sicurezza
-            if "LIMIT_HIT" in status_message:
-                QTimer.singleShot(10, lambda: self.show_limit_hit_popup(status_message))
-            
-            # Gestione Homing (LA SOLUZIONE)
-            elif "HOMING_COMPLETED" in status_message or "HOMED" in status_message:
-                # Imposta lo stato 'homed' su entrambi i widget
-                self.manual_control.is_homed = True
-                self.monotonic_test_widget.set_homing_status(True)
-                # *** NUOVO: Imposta homing anche per il widget ciclico ***
-                self.cyclic_test.set_homing_status(True) 
-                # Ripristina la UI del controllo manuale
-                self.manual_control.reset_homing_ui()
-                # Aggiorna i display per mostrare i valori numerici e rimuovere "Unhomed"
-                self.manual_control.update_displays() 
+                         QMessageBox.information(self, popup_title, popup_message)
 
-            # Gestione Homing Interrotto dall'utente
-            elif "STOPPED_BY_USER" in status_message and self.manual_control.is_homing_active:
-                self.manual_control.reset_homing_ui()
-
-            # Gestione Stop del Test Monotonico (da comando o da fine test)
+            # Gestione fine test monotonico (completato, stoppato, endstop)
             elif "TEST_COMPLETED" in status_message or \
                  ("TEST_STOPPED_BY_USER" in status_message and self.monotonic_test_widget.is_test_running) or \
                  ("TOP_HIT" in status_message and self.monotonic_test_widget.is_test_running) or \
                  ("BOTTOM_HIT" in status_message and self.monotonic_test_widget.is_test_running):
-                 
-                if self.monotonic_test_widget.is_test_running:
+                 if self.monotonic_test_widget.is_test_running:
                     self.monotonic_test_widget.on_stop_test(user_initiated=False)
-                    # Mostra un popup diverso se è un endstop
+                    popup_title = "Test Terminato"
+                    popup_message = f"Il test si è concluso con stato: {status_message}"
                     if "TOP_HIT" in status_message or "BOTTOM_HIT" in status_message:
-                        QMessageBox.critical(self, "Endstop Colpito", f"Test interrotto: {status_message}")
+                        popup_title = "Endstop Colpito"
+                        popup_message = f"Test interrotto: {status_message}"
+                        QMessageBox.critical(self, popup_title, popup_message)
                     else:
-                        QMessageBox.information(self, "Test Terminato", f"Il test si è concluso con stato: {status_message}")
-            
-            
-            return # I messaggi di stato non contengono dati di telemetria, quindi usciamo.
+                        QMessageBox.information(self, popup_title, popup_message)
 
-        # Se non è un messaggio di stato, allora è un messaggio di DATI.
-        load_N = None
-        displacement_mm = None
-        time_s = 0.0
-        cycle_count = 0 # Inizializza
+            # Gestione Limiti di Sicurezza (Usa il segnale thread-safe)
+            elif "LIMIT_HIT" in status_message:
+                self.limit_hit_signal.emit(status_message) # Emette il segnale
+
+            # Gestione Homing
+            elif "HOMING_COMPLETED" in status_message or "HOMED" in status_message:
+                self.manual_control.is_homed = True
+                self.monotonic_test_widget.set_homing_status(True)
+                self.cyclic_test.set_homing_status(True)
+                self.manual_control.reset_homing_ui()
+                self.manual_control.update_displays() # Aggiorna subito i display
+
+            # Gestione Homing Interrotto
+            elif "STOPPED_BY_USER" in status_message and self.manual_control.is_homing_active:
+                self.manual_control.reset_homing_ui()
+
+            # Altri messaggi di stato (es. TARE_DONE, CALIBRATION_DONE, etc.)
+            # Vengono mostrati nella status bar ma non richiedono azioni specifiche qui.
+
+            return # Fine gestione messaggi STATUS:
+
+        # --- GESTIONE MESSAGGI DI DATI ('D:') ---
+        # Se non era un messaggio di stato, prova a interpretarlo come dati
         try:
-            # Ora gestiamo SOLO il formato "D:", sia per lo streaming che per il polling
             if data.startswith("D:"):
                 payload = data[2:]
-                
-                # --- QUESTA È LA CORREZIONE DEFINITIVA ---
-                parts = payload.split(';') # Divide il payload in una lista
-                
-                if len(parts) == 4:
-                    # Formato STREAMING (load, pulses, time, cycle)
+                parts = payload.split(';')
+
+                # Inizializza i default QUI, dentro il blocco dove servono
+                load_N = None
+                displacement_mm = None
+                time_s = 0.0
+                cycle_count = 0
+                resistance_ohm = -999.0 # Valore default/fallback
+
+                # Parsing flessibile in base alla lunghezza
+                if len(parts) == 5: # Nuovo formato con LCR
+                    load_str, disp_str, time_ms_str, cycle_str, res_str = parts
+                    cycle_count = int(cycle_str)
+                    try: resistance_ohm = float(res_str)
+                    except ValueError: resistance_ohm = -2.0 # Errore parsing resistenza
+                elif len(parts) == 4: # Vecchio formato streaming
                     load_str, disp_str, time_ms_str, cycle_str = parts
                     cycle_count = int(cycle_str)
-                elif len(parts) == 3:
-                    # Formato POLLING (load, pulses, time=0)
+                    # resistance_ohm rimane -999.0
+                elif len(parts) == 3: # Formato Polling
                     load_str, disp_str, time_ms_str = parts
-                    cycle_count = 0 # Imposta il ciclo a 0 di default
+                    cycle_count = 0
+                    # resistance_ohm rimane -999.0
                 else:
-                    # Pacchetto corrotto o numero di valori inatteso
-                    raise ValueError(f"Attesi 3 o 4 valori, ricevuti {len(parts)}")
-                
+                    raise ValueError(f"Pacchetto D: attesi 3, 4 o 5 valori, ricevuti {len(parts)}")
+
                 # Parsing comune
                 load_grams = float(load_str)
                 pulse_count = int(disp_str)
                 time_s = float(time_ms_str) / 1000.0
-                # --- FINE CORREZIONE ---
-
                 load_N = (load_grams / 1000.0) * 9.81
                 displacement_mm = pulse_count * self.PULSES_TO_MM
-            else:
-                return # Se non è un messaggio 'D:' o 'STATUS:', ignora
+
+                # --- AZIONI SPOSTATE QUI DENTRO ---
+                # Se siamo arrivati qui, il parsing è OK e tutte le variabili sono definite.
+
+                current_widget = self.stacked_widget.currentWidget()
+
+                # Aggiornamento centralizzato variabili assolute (per tutti i widget)
+                widgets_to_update = [self.manual_control, self.monotonic_test_widget, self.cyclic_test]
+                for widget in widgets_to_update:
+                    if hasattr(widget, 'absolute_load_N'):
+                         widget.absolute_load_N = load_N
+                    if hasattr(widget, 'absolute_displacement_mm'):
+                         widget.absolute_displacement_mm = displacement_mm
+                    if hasattr(widget, 'current_resistance_ohm'):
+                        widget.current_resistance_ohm = resistance_ohm
+
+                # Calibrazione (caso speciale)
+                if hasattr(self.calibration_widget, 'abs_load_display'):
+                     self.calibration_widget.abs_load_display.set_value(f"{load_N:.3f}")
+
+                # Chiama handle_stream_data del widget corrente (se esiste)
+                if hasattr(current_widget, 'handle_stream_data'):
+                    current_widget.handle_stream_data(load_N, displacement_mm, time_s, cycle_count, resistance_ohm)
+
+                # Aggiorna i display del widget corrente (se esiste)
+                if hasattr(current_widget, 'update_displays'):
+                    current_widget.update_displays()
+                # --- FINE AZIONI SPOSTATE ---
+
+            # Se non inizia con 'D:' (e non era 'STATUS:'), ignora silenziosamente
 
         except (ValueError, IndexError) as e:
-            print(f"ERRORE PARSING: {e} | Dati: {data}") # Aggiunto debug
-            return # Ignora righe dati corrotte o malformate
-
-        # Se il parsing dei dati ha avuto successo, aggiorna l'applicazione
-        if load_N is not None and displacement_mm is not None:
-            current_widget = self.stacked_widget.currentWidget()
-
-            # --- AGGIORNAMENTO CENTRALIZZATO (Come nella versione STABLE) ---
-            # Aggiorna le variabili assolute in TUTTI i widget che le possiedono
-            
-            # Manual Control
-            if hasattr(self.manual_control, 'absolute_load_N'):
-                self.manual_control.absolute_load_N = load_N
-                self.manual_control.absolute_displacement_mm = displacement_mm
-                
-            # Monotonic Test
-            if hasattr(self.monotonic_test_widget, 'absolute_load_N'):
-                self.monotonic_test_widget.absolute_load_N = load_N
-                self.monotonic_test_widget.absolute_displacement_mm = displacement_mm
-                
-            # Cyclic Test (Aggiunto)
-            if hasattr(self.cyclic_test, 'absolute_load_N'):
-                self.cyclic_test.absolute_load_N = load_N
-                self.cyclic_test.absolute_displacement_mm = displacement_mm
-
-            # Calibration Widget (Caso speciale)
-            if hasattr(self.calibration_widget, 'abs_load_display'):
-                 self.calibration_widget.abs_load_display.set_value(f"{load_N:.3f}")
-            # --- FINE AGGIORNAMENTO CENTRALIZZATO ---
-
-            # Invia i dati in streaming al widget corrente (per i grafici)
-            if hasattr(current_widget, 'handle_stream_data'):
-                # Passa tutti i dati, inclusi tempo e ciclo
-                current_widget.handle_stream_data(load_N, displacement_mm, time_s, cycle_count)
-            
-            # --- AGGIORNAMENTO DISPLAY (COME NELLA VERSIONE STABLE) ---
-            # Aggiorna i display del widget corrente (es. i contatori)
-            if hasattr(current_widget, 'update_displays'):
-                current_widget.update_displays()
+            # Se c'è stato un errore durante il parsing di 'D:'
+            print(f"ERRORE PARSING DATI: {e} | Dati: {data}")
+            return # Ignora questa riga di dati
       
 
     def closeEvent(self, event):
