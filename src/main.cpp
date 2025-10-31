@@ -110,6 +110,14 @@ float ramp_speed_mms = 1.0;  // Velocità della rampa
 unsigned long ramp_hold_ms = 0; // Durata hold alla fine della rampa
 StopCriterion ramp_control_type; // CRITERION_DISP o CRITERION_FORCE
 
+const int LCR_RX_PIN = 16; // Pin RX dell'ESP32 (collegato a TX dell'LCR)
+const int LCR_TX_PIN = 17; // Pin TX dell'ESP32 (collegato a RX dell'LCR)
+volatile float last_lcr_resistance = -999.0f; // Ultimo valore valido letto (o errore)
+volatile bool lcr_polling_enabled = false; // Flag per attivare/disattivare la lettura
+volatile bool lcr_read_in_progress = false; // Flag per evitare richieste multiple
+unsigned long last_lcr_request_time = 0; // Per temporizzare le richieste
+const long LCR_REQUEST_INTERVAL_MS = 20; // Interroga LCR max 50 volte/sec (100ms) - Regola se necessario
+
 // --- PROTOTIPI ---
 void handleHardwareInputs();
 void startMotor(bool up);
@@ -121,10 +129,14 @@ void updateMotorState();
 void handleDataStreaming();
 bool readLoadNonBlocking(float* result);
 float averageLoadOverMs(unsigned long duration_ms);
+void updateLCRReading();
 
 void setup()
 {
   Serial.begin(460800);
+  Serial2.begin(115200, SERIAL_8N1, LCR_RX_PIN, LCR_TX_PIN);
+  delay(200);
+  Serial.println("Porta Seriale 2 per LCR Meter avviata...");
   Serial.println("ESP32 Avviato. Firmware con gestione seriale migliorata.");
 
   pinMode(PUL_PIN, OUTPUT);
@@ -168,6 +180,7 @@ void loop()
   handleDataStreaming();
   updateMotorState();
   //handleHardwareInputs();  TEMPORANEAMENTE DISABILITATO TASTI FISICI
+  updateLCRReading();
 }
 
 // --- Gestione seriale non bloccante ---
@@ -221,7 +234,19 @@ void handleSerialCommands()
 void processCommand(const String &command)
 {
   // STOP: priorità assoluta
-  if (command == "STOP")
+  if (command == "ENABLE_LCR_POLLING") {
+      lcr_polling_enabled = true;
+      last_lcr_resistance = -999.0f; // Resetta l'ultimo valore letto
+      lcr_read_in_progress = false;  // Resetta lo stato interno
+      Serial.println("STATUS:LCR_POLLING_ENABLED");
+      return; // Esci subito
+  } else if (command == "DISABLE_LCR_POLLING") {
+      lcr_polling_enabled = false;
+      Serial.println("STATUS:LCR_POLLING_DISABLED");
+      return; // Esci subito
+  }
+
+  else if (command == "STOP")
   {
     bool was_monotonic = (motor_state == MONOTONIC_TEST);
     bool was_cyclic = (motor_state == CYCLIC_TEST);
@@ -255,11 +280,15 @@ void processCommand(const String &command)
   {
     // Ora rispondiamo sempre con il formato 'D:', aggiungendo un timestamp fittizio di 0
     Serial.print("D:");
-    Serial.print(last_load_grams, 1);
+    Serial.print(last_load_grams, 1); // 1. Load
     Serial.print(";");
-    Serial.print(pulse_count);
+    Serial.print(pulse_count);        // 2. Pulses
     Serial.print(";");
-    Serial.println("0");
+    Serial.print("0");                // 3. Time (ms) - Fittizio
+    Serial.print(";");
+    Serial.print("0");                // 4. Cycle - Fittizio
+    Serial.print(";");
+    Serial.println(last_lcr_resistance, 4); // 5. Resistance
   }
   else if (command == "TARE")
   {
@@ -628,6 +657,65 @@ void setMotorSpeed(float speed_mms) {
                          (2.0 * PULSES_PER_REV * GEAR_RATIO * speed_mms);
     timerAlarmWrite(stepTimer, pulse_delay_micros, true);
   }
+}
+
+void updateLCRReading() {
+    // Se la lettura non è abilitata, imposta un valore non valido e esci
+    if (!lcr_polling_enabled) {
+        last_lcr_resistance = -999.0f; // Valore che indica "disabilitato"
+        lcr_read_in_progress = false; // Resetta stato interno
+        return;
+    }
+
+    unsigned long now = millis();
+
+    // 1. È ora di inviare una nuova richiesta?
+    // Invia solo se non c'è già una lettura in corso E se è passato abbastanza tempo
+    if (!lcr_read_in_progress && (now - last_lcr_request_time >= LCR_REQUEST_INTERVAL_MS)) {
+
+        // Svuota il buffer di ricezione da eventuali dati vecchi o spuri
+        while(Serial2.available()) {
+            Serial2.read();
+        }
+
+        // Invia la richiesta all'LCR meter
+        Serial2.println("FETCh?");
+        last_lcr_request_time = now; // Aggiorna il timer dell'ultima richiesta
+        lcr_read_in_progress = true; // Imposta il flag: "sto aspettando una risposta"
+        //Serial.println("DEBUG LCR: Richiesta inviata"); // Debug opzionale
+        return; // Esci e aspetta la risposta nel prossimo ciclo del loop()
+    }
+
+    // 2. C'è una risposta in attesa? (Controlla solo se lcr_read_in_progress è true)
+    if (lcr_read_in_progress) {
+        if (Serial2.available() > 0) {
+            // Risposta ricevuta! Leggila.
+            String response = Serial2.readStringUntil('\n');
+            response.trim(); // Rimuovi spazi/caratteri extra
+
+            // Estrai il primo valore numerico prima della virgola
+            int firstComma = response.indexOf(',');
+            if (firstComma != -1) {
+                String resistanceStr = response.substring(0, firstComma);
+                last_lcr_resistance = resistanceStr.toFloat();
+                 //Serial.print("DEBUG LCR: Ricevuto "); Serial.println(last_lcr_resistance); // Debug opzionale
+            } else {
+                // Errore: la risposta non contiene la virgola attesa
+                last_lcr_resistance = -2.0f; // Codice errore per parsing fallito
+                 //Serial.print("DEBUG LCR: Errore parsing risposta: "); Serial.println(response); // Debug opzionale
+            }
+            lcr_read_in_progress = false; // Lettura completata (o fallita), resetta il flag
+        }
+        // 3. È andata in timeout?
+        // Se è passato troppo tempo dall'invio della richiesta senza risposta
+        // Usiamo un timeout doppio rispetto all'intervallo per sicurezza
+        else if (now - last_lcr_request_time > (LCR_REQUEST_INTERVAL_MS * 2)) {
+            last_lcr_resistance = -1.0f; // Codice errore per timeout
+            lcr_read_in_progress = false; // Annulla l'attesa e preparati per una nuova richiesta
+             //Serial.println("DEBUG LCR: Timeout attesa risposta"); // Debug opzionale
+        }
+        // Altrimenti (nessuna risposta ancora e non in timeout), non fare nulla e aspetta ancora
+    }
 }
 
 void updateMotorState()
@@ -1086,7 +1174,9 @@ void handleDataStreaming() {
       Serial.print(";");
       Serial.print(elapsed_ms);
       Serial.print(";");
-      Serial.println(cyclic_current_cycle);
+      Serial.print(cyclic_current_cycle);
+      Serial.print(";");
+      Serial.println(last_lcr_resistance, 4);
     }
   }
 }
