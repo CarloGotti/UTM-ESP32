@@ -38,6 +38,31 @@ automaticamente in due nuovi punti oltre a `show_limits_dialog()`:
 - dopo ogni ricalibrazione di una cella (`update_calibration_status()`),
   con il nuovo limite di forza dedotto dal nome della cella.
 
+### Modifica: limite di forza di default abbassato da 100 N a 10 N
+
+Il valore di default di `default_force_limit_N` in `main.py` era 100 N,
+superiore al fondoscala reale della cella di carico attualmente montata
+(rischio di danneggiarla durante i test di verifica in laboratorio con la
+macchina fisicamente collegata). Abbassato a 10 N come nuovo default più
+prudente; resta comunque modificabile da "LIMITS" in qualunque momento.
+
+### Fix: comandi inviati subito dopo la connessione andavano persi (reset ESP32 su apertura porta)
+
+Testando la propagazione automatica dei limiti alla connessione (vedi voce
+precedente), è emerso che i comandi inviati da `on_connected()` non
+arrivavano al firmware: probabile causa, l'apertura della porta seriale da
+PC innesca un reset hardware dell'ESP32 (comportamento comune sulle schede
+con USB-seriale CH340/CP210x, usato normalmente per il flashing automatico).
+`SET_MODE:POLLING` e `SET_LIMITS` venivano inviati mentre il firmware era
+ancora in fase di boot e quindi non poteva riceverli, con l'effetto che i
+limiti di sicurezza restavano disattivati anche dopo il fix precedente,
+silenziosamente.
+
+Introdotto un ritardo di 2 secondi (`QTimer.singleShot`) tra l'evento di
+connessione e l'invio di questi comandi, spostati in un nuovo metodo
+`_send_post_connect_commands()`, per dare al firmware il tempo di
+completare il boot prima di riceverli.
+
 ## Manutenzione di questo changelog
 
 Da qui in avanti, ogni modifica sostanziale al codice (nuova feature, fix

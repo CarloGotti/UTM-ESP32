@@ -177,14 +177,17 @@ alcun meccanismo che li tenga sincronizzati se uno dei due cambia.
 
 ## Punti critici / fragili (confermati leggendo il codice, non modificati)
 
-1. **`MonotonicTestWidget.on_start_test()` va quasi certamente in crash su stop
-   criterion a Forza.** In [monotonic_test_widget.py:339](monotonic_test_widget.py#L339)
-   il codice fa `if target_force_abs_N > self.current_force_limit_N:` ma
-   `MonotonicTestWidget` **non definisce mai `self.current_force_limit_N`** — esiste
+1. ✅ **[RISOLTO 2026-07-02]** `MonotonicTestWidget.on_start_test()` andava in
+   crash su stop criterion a Forza. In [monotonic_test_widget.py:339](monotonic_test_widget.py#L339)
+   il codice faceva `if target_force_abs_N > self.current_force_limit_N:` ma
+   `MonotonicTestWidget` **non definiva mai `self.current_force_limit_N`** — esiste
    solo come `self.main_window.current_force_limit_N` (usato correttamente altrove,
    es. righe 342, 601, 610, 730, 737). Qualunque avvio di test monotonico con
-   `Stop Criterion = Force (N)` o `Stress (MPa)` solleva `AttributeError` a runtime.
-   `CyclicTestWidget` non ha questo problema: usa sempre `self.main_window.current_force_limit_N`.
+   `Stop Criterion = Force (N)` o `Stress (MPa)` sollevava `AttributeError` a
+   runtime. `CyclicTestWidget` non aveva questo problema: usa sempre
+   `self.main_window.current_force_limit_N`. Corretto il riferimento a
+   `self.main_window.current_force_limit_N`; verificato su hardware reale (vedi
+   `CHANGELOG.md`).
 
 2. **Il pulsante "Save Calibration" non salva nulla.**
    `CalibrationWidget.save_calibration()` ([calibration_widget.py:157-164](calibration_widget.py#L157-L164))
@@ -194,20 +197,30 @@ alcun meccanismo che li tenga sincronizzati se uno dei due cambia.
    sceglie un percorso, vede l'interazione completarsi, ma nessun file JSON viene
    scritto — probabilmente una feature rimasta a metà durante un refactor.
 
-3. **I limiti di sicurezza assoluti del firmware non sono mai sincronizzati
-   automaticamente.** `absolute_max_force_grams`/`absolute_max_pulse_count` in
-   `main.cpp` partono a valori enormi (`9999999`/`99999999`, cioè di fatto
-   disabilitati) e vengono aggiornati **solo** quando arriva un comando
-   `SET_LIMITS:...`, che parte **solo** da `MainWindow.show_limits_dialog()` quando
-   l'utente apre manualmente la finestra "LIMITS" e clicca Save
-   ([main.py:443-472](main.py#L443-L472)). `on_connected()` ([main.py:126-131](main.py#L126-L131))
-   non invia mai `SET_LIMITS` alla connessione, e `update_calibration_status()`
-   ([main.py:371-381](main.py#L371-L381)) aggiorna `self.current_force_limit_N` lato
-   GUI in base al nome della cella calibrata (es. "10N" → 10.0) ma **non lo propaga
-   al firmware**. Conseguenza pratica: dopo un power-cycle dell'ESP32 (o una nuova
-   connessione), la macchina **non ha limiti di forza/spostamento realmente attivi**
-   finché l'operatore non apre esplicitamente "LIMITS" e salva — anche se la GUI
-   mostra già un valore di default (100 N / 190 mm) che sembra "impostato".
+3. ✅ **[RISOLTO 2026-07-02]** I limiti di sicurezza assoluti del firmware non
+   erano mai sincronizzati automaticamente. `absolute_max_force_grams`/
+   `absolute_max_pulse_count` in `main.cpp` partono a valori enormi
+   (`9999999`/`99999999`, cioè di fatto disabilitati) e vengono aggiornati
+   **solo** quando arriva un comando `SET_LIMITS:...`. Prima del fix, quel
+   comando partiva solo da `MainWindow.show_limits_dialog()` quando l'utente
+   apriva manualmente "LIMITS" e cliccava Save; né `on_connected()` né
+   `update_calibration_status()` lo inviavano mai in automatico. Conseguenza
+   pratica: dopo un power-cycle dell'ESP32 la macchina non aveva limiti
+   realmente attivi finché l'operatore non apriva esplicitamente "LIMITS",
+   anche se la GUI mostrava già un valore di default (10 N / 190 mm) che
+   sembrava "impostato".
+
+   Estratta la logica di invio in `send_limits_to_firmware()`
+   ([main.py:445-452](main.py#L445-L452)), richiamata automaticamente sia da
+   `on_connected()` sia da `update_calibration_status()` (oltre che da
+   `show_limits_dialog()`). Durante il collaudo su hardware reale è emerso un
+   secondo problema correlato: i comandi inviati **subito** dopo la
+   connessione venivano persi, perché l'apertura della porta seriale causa
+   spesso un reset hardware dell'ESP32 (comune sulle schede con USB-seriale
+   CH340/CP210x), e il firmware non è ancora pronto a riceverli durante il
+   boot. Risolto ritardando l'invio di 2 secondi tramite
+   `_send_post_connect_commands()` ([main.py:126-135](main.py#L126-L135)).
+   Entrambi i fix sono verificati su macchina fisica (vedi `CHANGELOG.md`).
 
 4. **Firmware: spam di `Serial.println()` di debug non prefissati, ad alta
    frequenza, sul link dati.** `startMotor()` ([main.cpp:642-647](main.cpp#L642-L647))
@@ -259,8 +272,8 @@ alcun meccanismo che li tenga sincronizzati se uno dei due cambia.
 |---|---|---|---|
 | Baud rate | 460800 | 460800 | ✅ coerente (ma duplicato, nessuna negoziazione) |
 | Formato `D:` | fino a 5 campi, tollera 3/4 (storico) | sempre 5 campi | ✅ ma retrocompatibilità Python inutile |
-| Limiti sicurezza | GUI mostra 100N/190mm come "attivi" di default | Firmware disabilitato di default, attivato solo da `SET_LIMITS` esplicito | ⚠️ **gap di sicurezza**, vedi punto 3 |
-| Force stop criterion (monotonico) | invia `START_TEST` dopo un controllo di sicurezza sul limite | il controllo stesso crasha prima di inviare nulla | ⚠️ **bug bloccante**, vedi punto 1 |
+| Limiti sicurezza | GUI mostra 10N/190mm come "attivi" di default | Firmware disabilitato di default, ora ricevuto automaticamente alla connessione (con ritardo di boot) e dopo calibrazione | ✅ **risolto**, vedi punto 3 |
+| Force stop criterion (monotonico) | invia `START_TEST` dopo un controllo di sicurezza sul limite | il controllo funziona correttamente, nessun crash | ✅ **risolto**, vedi punto 1 |
 | Salvataggio calibrazione su file | utente si aspetta che "Save Calibration" scriva un file | segnale emesso ma non collegato | ⚠️ **funzione silenziosamente rotta**, vedi punto 2 |
 | `GET_SCALE` | mai chiamato | implementato e funzionante | codice morto lato protocollo |
 | Costanti meccaniche (`PULSES_PER_REV`, `GEAR_RATIO`, `SCREW_PITCH_MM`) | copia locale in `main.py` | copia locale in `main.cpp` | coerenti oggi, nessun single source of truth |

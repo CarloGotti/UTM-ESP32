@@ -35,7 +35,7 @@ class MainWindow(QMainWindow):
         self.PULSES_PER_REV = 2000.0; self.GEAR_RATIO = 10.0; self.SCREW_PITCH_MM = 5.0873
         self.PULSES_TO_MM = self.SCREW_PITCH_MM / (self.PULSES_PER_REV * self.GEAR_RATIO)
         
-        self.default_force_limit_N = 100.0
+        self.default_force_limit_N = 10.0
         self.current_force_limit_N = self.default_force_limit_N
         self.current_disp_limit_mm = 190.0
 
@@ -127,10 +127,16 @@ class MainWindow(QMainWindow):
         self.connect_button.setEnabled(False); self.disconnect_button.setEnabled(True)
         self.refresh_ports_button.setEnabled(False); self.port_selector.setEnabled(False)
         self.statusBar().showMessage(f"Connesso a {self.port_selector.currentText()}")
+        # Aprire la porta seriale può causare un reset hardware dell'ESP32 (comune
+        # sulle schede con USB-seriale CH340/CP210x): ritardiamo l'invio dei comandi
+        # iniziali per dargli il tempo di completare il boot, altrimenti vengono persi.
+        QTimer.singleShot(2000, self._send_post_connect_commands)
+        self.data_request_timer.start()
+
+    def _send_post_connect_commands(self):
         self.communicator.send_command("SET_MODE:POLLING")
         self.send_limits_to_firmware()
-        self.data_request_timer.start()
-        
+
     def on_disconnected(self):
         self.data_request_timer.stop()
         self.connect_button.setEnabled(True); self.disconnect_button.setEnabled(False)

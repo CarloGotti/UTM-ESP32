@@ -14,14 +14,19 @@ dall'ESP32.
 - **`MainWindow(QMainWindow)`** — finestra principale, unica classe del file.
   - `__init__()`: crea `SettingsManager`, costanti meccaniche
     (`PULSES_PER_REV`, `GEAR_RATIO`, `SCREW_PITCH_MM`, `PULSES_TO_MM`), i
-    limiti di sicurezza lato GUI (`current_force_limit_N` = 100 N di default,
+    limiti di sicurezza lato GUI (`current_force_limit_N` = 10 N di default,
     `current_disp_limit_mm` = 190 mm), il thread `SerialCommunicator`, tutti i
     widget e tutte le connessioni segnale/slot. Avvia anche il `QTimer` di
     polling a 100 ms (`data_request_timer`, non ancora avviato qui).
   - `on_connected()` / `on_disconnected()`: gestiscono lo stato dei pulsanti di
-    connessione e avviano/fermano `data_request_timer`. `on_connected()` invia
-    anche `SET_MODE:POLLING` e, tramite `send_limits_to_firmware()`, i limiti
-    di sicurezza correnti.
+    connessione e avviano/fermano `data_request_timer`. `on_connected()` non
+    invia più comandi seriali immediatamente: pianifica
+    `_send_post_connect_commands()` con `QTimer.singleShot(2000, ...)`, per dare
+    tempo al firmware di completare il boot nel caso l'apertura della porta
+    abbia causato un reset hardware dell'ESP32 (comune sulle schede con
+    USB-seriale CH340/CP210x). `_send_post_connect_commands()` invia
+    `SET_MODE:POLLING` e, tramite `send_limits_to_firmware()`, i limiti di
+    sicurezza correnti.
   - `handle_data_from_esp32(data)`: **cuore del dispatch**. Distingue righe
     `STATUS:` da righe `D:`.
     - Per `STATUS:`: interpreta per substring matching (`in`, non `==`) e
