@@ -1,10 +1,11 @@
 #include <Arduino.h>
-#include "HX711.h"
+#include <Wire.h>
+#include "SparkFun_Qwiic_Scale_NAU7802_Arduino_Library.h"
 
 // --- CONFIGURAZIONE PIN E PARAMETRI ---
 const int PUL_PIN = 2, DIR_PIN = 4, UP_BUTTON_PIN = 18, DOWN_BUTTON_PIN = 19;
 const int TOP_ENDSTOP_PIN = 22, BOTTOM_ENDSTOP_PIN = 23;
-const int LOADCELL_DOUT_PIN = 32, LOADCELL_SCK_PIN = 33;
+const int LOADCELL_SDA_PIN = 32, LOADCELL_SCL_PIN = 33;
 
 
 
@@ -15,7 +16,7 @@ const float PULSES_TO_MM = SCREW_PITCH_MM / (PULSES_PER_REV * GEAR_RATIO);
 unsigned long test_start_time = 0;
 
 // --- VARIABILI GLOBALI ---
-HX711 scale;
+NAU7802 scale;
 volatile long pulse_count = 0;
 volatile bool pulse_state = LOW;
 volatile bool motor_enabled = false;
@@ -26,9 +27,6 @@ volatile bool move_completed_flag = false;  // evento: movimento a passi contati
 // Inizializzati a valori molto alti (quindi "disabilitati" di default)
 volatile long absolute_max_pulse_count = 99999999;
 volatile float absolute_max_force_grams = 9999999;
-// --- GESTIONE SPIKE DI FORZA ---
-volatile int over_force_limit_counter = 0;
-const int SPIKE_FILTER_COUNT = 5; // Richiede 5 letture consecutive sopra il limite per attivare lo stop
 bool limit_hit_notification_sent = false; // <-- NUOVA BANDIERINA
 
 
@@ -70,6 +68,13 @@ if (target_steps_remaining > 0) {
 // Cache lettura carico (in grammi)
 volatile float last_load_grams = 0.0f;
 
+// --- FILTRO EMA CELLA DI CARICO (NAU7802) ---
+float filter_alpha = 0.5f;         // 0.01-1.0, configurabile via SET_FILTER_CONFIG
+int filter_rate_sps = 320;         // sample rate NAU7802 corrente, configurabile via SET_FILTER_CONFIG
+int filter_pga_gain = 128;         // guadagno PGA corrente (128x), configurabile via SET_FILTER_CONFIG
+float filtered_load_grams = 0.0f;  // stato persistente del filtro EMA
+bool filter_seeded = false;        // true dopo il primo campione valido (o dopo un reset esplicito)
+
 
 
 // --- ARCHITETTURA A STATI PER LA COMUNICAZIONE ---
@@ -85,8 +90,6 @@ String serial_buffer;
 enum StopCriterion { CRITERION_DISP, CRITERION_FORCE };
 StopCriterion stop_criterion;
 float stop_value; // mm o grammi (assoluti)
-int stop_criterion_force_counter = 0;
-const int STOP_CRITERION_SPIKE_COUNT = 5;
 
 // --- PROVA CICLICA ---
 enum CyclicPhase { CYCLIC_PREPOSITION, CYCLIC_MOVING_UP, CYCLIC_HOLDING_UPPER, CYCLIC_MOVING_DOWN, CYCLIC_HOLDING_LOWER, CYCLIC_PAUSED, RAMPING, RAMP_HOLDING };
@@ -100,8 +103,6 @@ unsigned long cyclic_hold_lower_ms = 0; // Pausa al limite inf. (in ms)
 int cyclic_target_cycles = 0; // Numero di cicli richiesti
 volatile int cyclic_current_cycle = 0; // Contatore cicli attuale
 unsigned long hold_start_time = 0; // Per gestire le pause
-int cyclic_force_counter = 0; // Contatore anti-spike per il controllo di forza
-volatile bool new_load_data_available = false;
 
 // --- NUOVE VARIABILI PER LA RAMPA ---
 float ramp_target_value = 0; // Target in passi o grammi (assoluto)
@@ -146,9 +147,13 @@ void setup()
   pinMode(UP_BUTTON_PIN, INPUT_PULLUP);
   pinMode(DOWN_BUTTON_PIN, INPUT_PULLUP);
 
-  scale.begin(LOADCELL_DOUT_PIN, LOADCELL_SCK_PIN);
-  scale.set_scale(1.0);
-  scale.tare();
+  Wire.begin(LOADCELL_SDA_PIN, LOADCELL_SCL_PIN);
+  scale.begin(Wire);
+  scale.setGain(NAU7802_GAIN_128); // Esplicito per chiarezza (coincide col default interno di begin())
+  scale.setSampleRate(NAU7802_SPS_320);
+  scale.calibrateAFE();
+  scale.setCalibrationFactor(1.0);
+  // Nessun auto-zero: la cella va sempre ri-tarata dopo il boot (comportamento invariato)
 
   // Timer hardware: prescaler 80 → 1 tick = 1 µs
   stepTimer = timerBegin(0, 80, true);
@@ -297,9 +302,9 @@ void processCommand(const String &command)
     unsigned long start = millis();
     while (millis() - start < 1000)
     {
-      if (scale.is_ready())
+      if (scale.available())
       {
-        offset += scale.read();
+        offset += scale.getReading();
         count++;
       }
       delay(2);
@@ -307,7 +312,8 @@ void processCommand(const String &command)
     if (count > 0)
     {
       offset /= count;
-      scale.set_offset(offset);
+      scale.setZeroOffset(offset);
+      filter_seeded = false; // Ri-semina l'EMA: l'offset è cambiato
       Serial.print("STATUS:TARE_DONE;OFFSET=");
       Serial.println(offset);
     }
@@ -322,9 +328,9 @@ void processCommand(const String &command)
       unsigned long start = millis();
       while (millis() - start < 1000)
       {
-        if (scale.is_ready())
+        if (scale.available())
         {
-          sum += scale.read();
+          sum += scale.getReading();
           count++;
         }
         delay(2);
@@ -332,9 +338,10 @@ void processCommand(const String &command)
       if (count > 0)
       {
         long raw_avg = sum / count;
-        long offset = scale.get_offset();
+        long offset = scale.getZeroOffset();
         float new_scale = (raw_avg - offset) / known_weight_grams;
-        scale.set_scale(new_scale);
+        scale.setCalibrationFactor(new_scale);
+        filter_seeded = false; // Ri-semina l'EMA: il fattore di scala è cambiato
         Serial.print("STATUS:CALIBRATION_DONE;SCALE=");
         Serial.println(new_scale, 6);
       }
@@ -343,12 +350,13 @@ void processCommand(const String &command)
   else if (command == "GET_SCALE")
   {
     Serial.print("SCALE:");
-    Serial.println(scale.get_scale(), 4);
+    Serial.println(scale.getCalibrationFactor(), 4);
   }
   else if (command.startsWith("SET_SCALE:"))
   {
     float new_scale = command.substring(10).toFloat();
-    scale.set_scale(new_scale);
+    scale.setCalibrationFactor(new_scale);
+    filter_seeded = false; // Ri-semina l'EMA: il fattore di scala è cambiato (stesso caso di CALIBRATE)
     Serial.println("STATUS:SCALE_SET");
   }
   else if (command.startsWith("SET_LIMITS:"))
@@ -373,7 +381,82 @@ void processCommand(const String &command)
     // Questo è l'unico output necessario per la comunicazione con la GUI
     Serial.println("STATUS:LIMITS_SET;MAX_FORCE_G=" + String(absolute_max_force_grams) + ";MAX_PULSES=" + String(absolute_max_pulse_count));
   }
-  else if (command == "RETURN_TO_START") 
+  else if (command.startsWith("SET_FILTER_CONFIG:"))
+  {
+    String params = command.substring(18);
+    int alpha_idx = params.indexOf("ALPHA=");
+    int rate_idx = params.indexOf("RATE=");
+    int gain_idx = params.indexOf("GAIN=");
+
+    bool valid = (alpha_idx != -1 && rate_idx != -1);
+    float new_alpha = 0.0f;
+    int new_rate = 0;
+    int new_gain = filter_pga_gain; // invariato se GAIN assente (retrocompatibilità)
+    bool gain_provided = (gain_idx != -1);
+
+    if (valid) {
+      new_alpha = params.substring(alpha_idx + 6).toFloat();
+      new_rate = params.substring(rate_idx + 5).toInt();
+      valid = (new_alpha >= 0.01f && new_alpha <= 1.0f) &&
+              (new_rate == 10 || new_rate == 20 || new_rate == 40 || new_rate == 80 || new_rate == 320);
+    }
+
+    if (valid && gain_provided) {
+      new_gain = params.substring(gain_idx + 5).toInt();
+      valid = (new_gain == 1 || new_gain == 2 || new_gain == 4 || new_gain == 8 ||
+               new_gain == 16 || new_gain == 32 || new_gain == 64 || new_gain == 128);
+    }
+
+    if (valid) {
+      uint8_t sps_enum;
+      switch (new_rate) {
+        case 10:  sps_enum = NAU7802_SPS_10;  break;
+        case 20:  sps_enum = NAU7802_SPS_20;  break;
+        case 40:  sps_enum = NAU7802_SPS_40;  break;
+        case 80:  sps_enum = NAU7802_SPS_80;  break;
+        default:  sps_enum = NAU7802_SPS_320; break;
+      }
+      filter_alpha = new_alpha;
+      filter_rate_sps = new_rate;
+      scale.setSampleRate(sps_enum);
+
+      if (gain_provided) {
+        bool gain_changed = (new_gain != filter_pga_gain);
+
+        uint8_t gain_enum;
+        switch (new_gain) {
+          case 1:   gain_enum = NAU7802_GAIN_1;   break;
+          case 2:   gain_enum = NAU7802_GAIN_2;   break;
+          case 4:   gain_enum = NAU7802_GAIN_4;   break;
+          case 8:   gain_enum = NAU7802_GAIN_8;   break;
+          case 16:  gain_enum = NAU7802_GAIN_16;  break;
+          case 32:  gain_enum = NAU7802_GAIN_32;  break;
+          case 64:  gain_enum = NAU7802_GAIN_64;  break;
+          default:  gain_enum = NAU7802_GAIN_128; break;
+        }
+        filter_pga_gain = new_gain;
+        scale.setGain(gain_enum);
+
+        if (gain_changed) {
+          // Offset e fattore di scala erano validi solo al gain precedente:
+          // invalidali esplicitamente invece di lasciare letture sbagliate silenziose.
+          scale.setZeroOffset(0);
+          scale.setCalibrationFactor(1.0);
+          Serial.println("STATUS:CALIBRATION_INVALIDATED;REASON=GAIN_CHANGED");
+        }
+      }
+
+      filter_seeded = false; // Ri-semina l'EMA: alpha/rate/gain sono cambiati
+      Serial.println("STATUS:FILTER_CONFIG_SET;ALPHA=" + String(filter_alpha, 3) + ";RATE=" + String(filter_rate_sps) + ";GAIN=" + String(filter_pga_gain));
+    } else {
+      Serial.println("STATUS:FILTER_CONFIG_REJECTED;REASON=OUT_OF_RANGE");
+    }
+  }
+  else if (command == "GET_FILTER_CONFIG")
+  {
+    Serial.println("STATUS:FILTER_CONFIG;ALPHA=" + String(filter_alpha, 3) + ";RATE=" + String(filter_rate_sps) + ";GAIN=" + String(filter_pga_gain));
+  }
+  else if (command == "RETURN_TO_START")
   {
     long delta = start_pulse_count - pulse_count;  // quanti passi servono per tornare
     if (delta == 0) {
@@ -423,7 +506,6 @@ void processCommand(const String &command)
 
     // --- Inizializzazione Test ---
     cyclic_current_cycle = 0;
-    cyclic_force_counter = 0; // Resetta contatore anti-spike
     setMotorSpeed(cyclic_speed_mms); // Imposta la velocità
     motor_state = CYCLIC_TEST;
     comms_mode = STREAMING;
@@ -571,7 +653,6 @@ void processCommand(const String &command)
       else if (crit_str == "FORCE") stop_criterion = CRITERION_FORCE;
 
       stop_value = stop_val_str.toFloat();
-      stop_criterion_force_counter = 0;
       comms_mode = STREAMING;
       motor_state = MONOTONIC_TEST;
       startMotor(true);  // avvia in direzione "up"
@@ -721,10 +802,6 @@ void updateLCRReading() {
 void updateMotorState()
 {
   //Serial.println("Entro in update motor state");
-  // --- INIZIO CORREZIONE: Snapshot del flag "new data" ---
-  // Leggiamo il flag una sola volta all'inizio della funzione
-  bool is_fresh_reading = new_load_data_available;
-  // --- FINE CORREZIONE ---
 
   // --- NUOVO: CONTROLLO LIMITI DI SICUREZZA ASSOLUTI ---
   bool should_stop = false;
@@ -748,24 +825,15 @@ void updateMotorState()
     return;
   }
 
-  // 2. Controllo Limite di Forza con Filtro Anti-Spike
+  // 2. Controllo Limite di Forza (valore già filtrato via EMA in readLoadNonBlocking)
   if (last_load_grams > absolute_max_force_grams) {
-    // --- CORREZIONE: Usa il flag anche per i limiti di sicurezza ---
-    if (is_fresh_reading) {
-        over_force_limit_counter++; // Incrementa solo se è un *nuovo* dato
-    }
-  } else {
-    over_force_limit_counter = 0; 
-  }
-
-  if (over_force_limit_counter >= SPIKE_FILTER_COUNT) {
     motor_state = STOPPED;
     comms_mode = POLLING;
     stopMotor();
-    if (!limit_hit_notification_sent) { 
+    if (!limit_hit_notification_sent) {
         Serial.println("STATUS:LIMIT_HIT_FORCE");
-        limit_hit_notification_sent = true; 
-    }    over_force_limit_counter = 0; 
+        limit_hit_notification_sent = true;
+    }
     return;
   }
   // --- FINE BLOCCO CONTROLLO LIMITI ---
@@ -885,16 +953,8 @@ void updateMotorState()
         }
     } 
     else if (stop_criterion == CRITERION_FORCE) {
+        // Valore già filtrato via EMA (vedi readLoadNonBlocking): confronto diretto
         if (last_load_grams >= stop_value) {
-            // --- CORREZIONE: Usa il flag anche per lo stop monotonico ---
-            if (is_fresh_reading) {
-                stop_criterion_force_counter++;
-            }
-        } else {
-            stop_criterion_force_counter = 0;
-        }
-
-        if (stop_criterion_force_counter >= STOP_CRITERION_SPIKE_COUNT) {
             criterion_met = true;
         }
     }
@@ -956,22 +1016,12 @@ void updateMotorState()
                 bool limit_reached = false;
                 if (cyclic_control_type == CRITERION_DISP) {
                     limit_reached = (pulse_count >= (long)cyclic_upper_limit);
-                } else { // CRITERION_FORCE
-                    // --- INIZIO CORREZIONE: Logica contatore protetta dal flag ---
-                    if (last_load_grams >= cyclic_upper_limit) {
-                        if (is_fresh_reading) { // Incrementa solo se è un *nuovo* dato
-                            cyclic_force_counter++;
-                        }
-                    } else {
-                        cyclic_force_counter = 0; // Resetta sempre
-                    }
-                    limit_reached = (cyclic_force_counter >= STOP_CRITERION_SPIKE_COUNT);
-                    // --- FINE CORREZIONE ---
+                } else { // CRITERION_FORCE - valore già filtrato via EMA, confronto diretto
+                    limit_reached = (last_load_grams >= cyclic_upper_limit);
                 }
 
                 if (limit_reached) {
-                    stopMotor(); 
-                    cyclic_force_counter = 0; 
+                    stopMotor();
                     if (cyclic_hold_upper_ms > 0) {
                         cyclic_phase = CYCLIC_HOLDING_UPPER;
                         hold_start_time = current_time; 
@@ -995,23 +1045,12 @@ void updateMotorState()
                 bool limit_reached = false;
                  if (cyclic_control_type == CRITERION_DISP) {
                     limit_reached = (pulse_count <= (long)cyclic_lower_limit);
-                } else { // CRITERION_FORCE
-                    // --- INIZIO CORREZIONE: Logica contatore protetta dal flag ---
-                    if (last_load_grams <= cyclic_lower_limit) { 
-                        if (is_fresh_reading) { // Incrementa solo se è un *nuovo* dato
-                            cyclic_force_counter++;
-                        }
-                    } else {
-                        cyclic_force_counter = 0; // Resetta sempre
-                    }
-                    limit_reached = (cyclic_force_counter >= STOP_CRITERION_SPIKE_COUNT);
-                    // --- FINE CORREZIONE ---
+                } else { // CRITERION_FORCE - valore già filtrato via EMA, confronto diretto
+                    limit_reached = (last_load_grams <= cyclic_lower_limit);
                 }
 
                 if (limit_reached) {
                     stopMotor();
-                    cyclic_force_counter = 0;
-                    
 
                     if (cyclic_current_cycle >= cyclic_target_cycles)
                     {
@@ -1091,14 +1130,9 @@ void updateMotorState()
                         // if (target_reached) Serial.println("[RAMP DBG] DISP DOWN TARGET REACHED!");
                         // --- FINE DEBUG ---
                     }
-                } else { // CRITERION_FORCE
-                   // ... (Logica forza invariata, eventualmente aggiungere debug simile se serve) ...
-                    bool condition_met = false;
-                    if (dir_up) { condition_met = (last_load_grams >= ramp_target_value); }
-                    else { condition_met = (last_load_grams <= ramp_target_value); }
-                    if (condition_met) { if (is_fresh_reading) { cyclic_force_counter++; } }
-                    else { cyclic_force_counter = 0; }
-                    target_reached = (cyclic_force_counter >= STOP_CRITERION_SPIKE_COUNT);
+                } else { // CRITERION_FORCE - valore già filtrato via EMA, confronto diretto
+                    if (dir_up) { target_reached = (last_load_grams >= ramp_target_value); }
+                    else { target_reached = (last_load_grams <= ramp_target_value); }
                 }
 
                 // --- DEBUG FINALE ---
@@ -1111,7 +1145,6 @@ void updateMotorState()
                     // Serial.println("[RAMP DBG] Condition MET! Stopping motor and completing block.");
                     // --- FINE DEBUG ---
                     stopMotor();
-                    cyclic_force_counter = 0;
 
                     if (ramp_hold_ms > 0) {
                         cyclic_phase = RAMP_HOLDING;
@@ -1140,13 +1173,6 @@ void updateMotorState()
 
         } // Fine switch(cyclic_phase)
     } // Fine else if (motor_state == CYCLIC_TEST)
-
-  // --- INIZIO CORREZIONE: Consuma il flag ---
-  // Alla fine della funzione, abbassa la bandierina
-  if (is_fresh_reading) {
-      new_load_data_available = false;
-  }
-  // --- FINE CORREZIONE ---
 }
 
 
@@ -1156,7 +1182,6 @@ void handleDataStreaming() {
   float current_grams;
   if (readLoadNonBlocking(&current_grams)) {
     last_load_grams = current_grams;
-    new_load_data_available = true;
   }
 
   if (comms_mode == STREAMING) {
@@ -1181,17 +1206,20 @@ void handleDataStreaming() {
   }
 }
 
-// --- Lettura non bloccante HX711 ---
-bool use_filter = false;
-
+// --- Lettura non bloccante NAU7802 con filtro EMA ---
 bool readLoadNonBlocking(float* result)
 {
-  if (scale.is_ready())
+  if (scale.available())
   {
-    long raw = scale.read();
-    // Non usiamo più il filtro qui, la lettura deve essere grezza e veloce
-    *result = (raw - scale.get_offset()) / scale.get_scale();
-    return true; // Successo! Un nuovo valore è disponibile.
+    float raw = (scale.getReading() - scale.getZeroOffset()) / scale.getCalibrationFactor();
+    if (!filter_seeded) {
+      filtered_load_grams = raw;
+      filter_seeded = true;
+    } else {
+      filtered_load_grams = filter_alpha * raw + (1.0f - filter_alpha) * filtered_load_grams;
+    }
+    *result = filtered_load_grams;
+    return true; // Successo! Un nuovo valore filtrato è disponibile.
   }
   return false; // Nessun nuovo dato disponibile dal sensore.
 }
@@ -1206,10 +1234,10 @@ float averageLoadOverMs(unsigned long duration_ms)
 
   while (millis() - start < duration_ms)
   {
-    if (scale.is_ready())
+    if (scale.available())
     {
-      long raw = scale.read();
-      float grams = (raw - scale.get_offset()) / scale.get_scale();
+      int32_t raw = scale.getReading();
+      float grams = (raw - scale.getZeroOffset()) / scale.getCalibrationFactor();
       sum += grams;
       count++;
     }
