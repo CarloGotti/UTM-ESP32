@@ -336,7 +336,7 @@ class MonotonicTestWidget(QWidget):
             target_force_abs_N = stop_val + self.load_offset_N
 
             # --- NUOVO: ALERT DI SICUREZZA ---
-            if target_force_abs_N > self.current_force_limit_N:
+            if target_force_abs_N > self.main_window.current_force_limit_N:
                 reply = QMessageBox.warning(
                     self, "Limite di Sicurezza Superato",
                     f"La forza target ... supera il limite ... ({self.main_window.current_force_limit_N:.2f} N).\n\n" 

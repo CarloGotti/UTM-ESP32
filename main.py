@@ -128,6 +128,7 @@ class MainWindow(QMainWindow):
         self.refresh_ports_button.setEnabled(False); self.port_selector.setEnabled(False)
         self.statusBar().showMessage(f"Connesso a {self.port_selector.currentText()}")
         self.communicator.send_command("SET_MODE:POLLING")
+        self.send_limits_to_firmware()
         self.data_request_timer.start()
         
     def on_disconnected(self):
@@ -377,6 +378,7 @@ class MainWindow(QMainWindow):
         # Se viene calibrata una nuova cella, aggiorna direttamente il limite di forza attivo.
         try:
             self.current_force_limit_N = float(cell_name.upper().replace("N", ""))
+            self.send_limits_to_firmware()
         except (ValueError, TypeError):
             print(f"Attenzione: impossibile aggiornare il limite dal nome cella '{cell_name}'")
 
@@ -440,6 +442,15 @@ class MainWindow(QMainWindow):
 
         QTimer.singleShot(10, perform_limit_hit_actions)
 
+    def send_limits_to_firmware(self):
+        """
+        Costruisce e invia al firmware il comando SET_LIMITS usando i limiti
+        assoluti correnti (self.current_force_limit_N / self.current_disp_limit_mm).
+        """
+        force_grams = (self.current_force_limit_N / 9.81) * 1000.0
+        command = f"SET_LIMITS:FORCE_G={force_grams:.2f};DISP_MM={self.current_disp_limit_mm:.4f}"
+        self.communicator.send_command(command)
+
     def show_limits_dialog(self):
         """
         Mostra la finestra di dialogo per impostare i limiti e invia il comando al firmware.
@@ -452,18 +463,9 @@ class MainWindow(QMainWindow):
             new_force_N, new_disp_mm = dialog.get_values()
             self.current_force_limit_N = new_force_N
             self.current_disp_limit_mm = new_disp_mm
-            
-            # 1. Prepara i valori per il firmware
-            # Converte la forza da Newton a grammi
-            force_grams = (new_force_N / 9.81) * 1000.0
-            
-            # 2. Costruisci la stringa di comando
-            command = f"SET_LIMITS:FORCE_G={force_grams:.2f};DISP_MM={new_disp_mm:.4f}"
-            # NUOVA RIGA DI DEBUG
-            #print(f"DEBUG GUI: Invio comando '{command}'")
-            
-            # 3. Invia il comando all'ESP32
-            self.communicator.send_command(command)
+
+            # Costruisci e invia il comando al firmware (logica condivisa)
+            self.send_limits_to_firmware()
             
             # Messaggio di conferma per l'utente
             QMessageBox.information(self, "Limiti Impostati", 
