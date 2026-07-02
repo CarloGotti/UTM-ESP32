@@ -1,4 +1,4 @@
-from PyQt6.QtWidgets import QWidget, QVBoxLayout, QLabel, QFrame, QDialog, QFormLayout, QDialogButtonBox, QDoubleSpinBox, QMessageBox
+from PyQt6.QtWidgets import QWidget, QVBoxLayout, QLabel, QFrame, QDialog, QFormLayout, QDialogButtonBox, QDoubleSpinBox, QComboBox, QMessageBox
 from PyQt6.QtCore import Qt, QRectF, QLocale
 from PyQt6.QtGui import QFont, QPainter, QColor
 
@@ -115,3 +115,50 @@ class LimitsDialog(QDialog):
     def get_values(self):
         """ Ritorna i valori impostati dall'utente. """
         return self.force_limit_spinbox.value(), self.disp_limit_spinbox.value()
+
+class FilterConfigDialog(QDialog):
+    """
+    Finestra di dialogo per configurare il filtro EMA e il guadagno PGA
+    della cella di carico (NAU7802): alpha, sample rate e gain.
+    """
+    def __init__(self, current_alpha, current_rate_sps, current_gain, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Configurazione Filtro Cella di Carico")
+        self.setMinimumWidth(400)
+
+        locale_c = QLocale("C")
+        layout = QFormLayout(self)
+
+        self.alpha_spinbox = QDoubleSpinBox()
+        self.alpha_spinbox.setLocale(locale_c)
+        self.alpha_spinbox.setDecimals(2)
+        self.alpha_spinbox.setRange(0.01, 1.00)
+        self.alpha_spinbox.setSingleStep(0.01)
+        self.alpha_spinbox.setValue(current_alpha)
+
+        self.rate_combo = QComboBox()
+        self.rate_combo.addItems(["10 SPS", "20 SPS", "40 SPS", "80 SPS", "320 SPS"])
+        current_rate_text = f"{current_rate_sps} SPS"
+        index = self.rate_combo.findText(current_rate_text)
+        self.rate_combo.setCurrentIndex(index if index != -1 else self.rate_combo.count() - 1)
+
+        self.gain_combo = QComboBox()
+        self.gain_combo.addItems(["1x", "2x", "4x", "8x", "16x", "32x", "64x", "128x"])
+        current_gain_text = f"{current_gain}x"
+        gain_index = self.gain_combo.findText(current_gain_text)
+        self.gain_combo.setCurrentIndex(gain_index if gain_index != -1 else 0)
+
+        layout.addRow("Alpha (EMA):", self.alpha_spinbox)
+        layout.addRow("Sample Rate NAU7802:", self.rate_combo)
+        layout.addRow("Guadagno PGA:", self.gain_combo)
+
+        button_box = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)
+        button_box.accepted.connect(self.accept)
+        button_box.rejected.connect(self.reject)
+        layout.addWidget(button_box)
+
+    def get_values(self):
+        """ Ritorna (alpha: float, rate_sps: int, gain: int). """
+        rate_sps = int(self.rate_combo.currentText().split()[0])
+        gain = int(self.gain_combo.currentText().rstrip('x'))
+        return self.alpha_spinbox.value(), rate_sps, gain

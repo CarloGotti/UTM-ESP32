@@ -12,10 +12,11 @@ class SettingsManager:
             "cal_loads": {
                 "1N": [0.0, 44.0],
                 "10N": [0.0, 398.0],
-                "50N": [0.0, 398.0],
+                "50N": [0.0, 298.0],
                 "100N": [0.0, 1398.0],
                 "200N": [0.0, 1398.0]
-            }
+            },
+            "filter_config": {"alpha": 0.5, "rate_sps": 320, "gain": 128}
         }
 
     def load_settings(self):

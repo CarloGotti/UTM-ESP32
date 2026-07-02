@@ -4,7 +4,8 @@
 
 Raccolta di widget Qt riusabili e senza logica applicativa specifica,
 condivisi da tutte le schermate: un indicatore numerico standard, una barra
-di velocità colorata, e il dialog dei limiti di sicurezza macchina.
+di velocità colorata, il dialog dei limiti di sicurezza macchina e il dialog
+di configurazione del filtro della cella di carico.
 
 ## Classi e funzioni principali
 
@@ -24,6 +25,18 @@ di velocità colorata, e il dialog dei limiti di sicurezza macchina.
   tupla `(force_N, disp_mm)` inseriti dall'utente. Non invia nulla da solo:
   è `MainWindow.show_limits_dialog()` a leggere i valori e inviare
   `SET_LIMITS` al firmware.
+- **`FilterConfigDialog(QDialog)`** — form con un `QDoubleSpinBox` (alpha
+  del filtro EMA, range 0.01–1.00), un `QComboBox` (sample rate NAU7802,
+  valori fissi "10/20/40/80/320 SPS") e un secondo `QComboBox` (guadagno
+  PGA, valori fissi "1x/2x/4x/8x/16x/32x/64x/128x") pre-popolati con i
+  valori correnti passati al costruttore. `get_values()` ritorna la tupla
+  `(alpha: float, rate_sps: int, gain: int)`. Stesso pattern di
+  `LimitsDialog`: non invia nulla da solo, è `MainWindow.show_filter_dialog()`
+  a leggere i valori, salvarli in `settings.json` e inviare
+  `SET_FILTER_CONFIG` al firmware. Non mostra alcun avviso se il gain
+  cambia — quello arriva separatamente e in modo asincrono dalla GUI
+  quando il firmware conferma l'invalidazione della calibrazione (vedi
+  `docs/main.md`).
 
 ## Dipendenze
 
@@ -47,3 +60,9 @@ di velocità colorata, e il dialog dei limiti di sicurezza macchina.
 - `SpeedBarWidget` ridisegna l'intera barra ad ogni `paintEvent` con un
   ciclo su tutti i segmenti: non è un problema alle dimensioni attuali, ma
   non è pensato per aggiornamenti a frequenza molto alta.
+- `FilterConfigDialog.get_values()` estrae sample rate e gain numerici dal
+  testo dei combo box (`"320 SPS".split()[0]`, `"128x".rstrip('x')`) invece
+  di associare un dato numerico esplicito a ogni voce (es. con `userData`):
+  funziona perché le voci sono hardcoded nello stesso metodo `__init__`, ma
+  se in futuro le etichette cambiano formato (es. localizzazione, spazi
+  diversi) questo parsing va aggiornato in coppia con `addItems()`.

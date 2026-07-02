@@ -11,7 +11,7 @@ from monotonic_test_widget import MonotonicTestWidget
 from cyclic_test_widget import CyclicTestWidget
 from communication import SerialCommunicator 
 from settings_manager import SettingsManager
-from custom_widgets import LimitsDialog
+from custom_widgets import LimitsDialog, FilterConfigDialog
 
 
 class MainWindow(QMainWindow):
@@ -38,6 +38,9 @@ class MainWindow(QMainWindow):
         self.default_force_limit_N = 10.0
         self.current_force_limit_N = self.default_force_limit_N
         self.current_disp_limit_mm = 190.0
+        self.current_filter_alpha = self.settings['filter_config']['alpha']
+        self.current_filter_rate_sps = self.settings['filter_config']['rate_sps']
+        self.current_filter_pga_gain = self.settings['filter_config']['gain']
 
         self.comm_thread = QThread(); self.communicator = SerialCommunicator()
         self.communicator.moveToThread(self.comm_thread)
@@ -70,6 +73,7 @@ class MainWindow(QMainWindow):
         
         self.main_menu.manual_button.clicked.connect(self.show_manual_control)
         self.main_menu.calibrate_button.clicked.connect(self.show_calibration)
+        self.main_menu.filter_button.clicked.connect(self.show_filter_dialog)
         self.main_menu.monotonic_button.clicked.connect(self.show_monotonic_test)
         self.main_menu.cyclic_button.clicked.connect(self.show_cyclic_test)
         
@@ -136,6 +140,7 @@ class MainWindow(QMainWindow):
     def _send_post_connect_commands(self):
         self.communicator.send_command("SET_MODE:POLLING")
         self.send_limits_to_firmware()
+        self.send_filter_config_to_firmware()
 
     def on_disconnected(self):
         self.data_request_timer.stop()
@@ -276,6 +281,17 @@ class MainWindow(QMainWindow):
             # Gestione Limiti di Sicurezza (Usa il segnale thread-safe)
             elif "LIMIT_HIT" in status_message:
                 self.limit_hit_signal.emit(status_message) # Emette il segnale
+
+            # Gestione invalidazione calibrazione (es. cambio gain PGA, sia da dialog
+            # sia da reinvio automatico alla connessione con un gain diverso da quello di boot)
+            elif "CALIBRATION_INVALIDATED" in status_message:
+                self.active_calibration_info = "Not Calibrated"
+                self.manual_control.set_calibration_status(self.active_calibration_info)
+                self.monotonic_test_widget.set_calibration_status(self.active_calibration_info)
+                QMessageBox.warning(self, "Ricalibrazione Necessaria",
+                                    f"Il firmware ha invalidato la calibrazione corrente "
+                                    f"({status_message}).\n\n"
+                                    f"Esegui Tara e Calibrazione prima di usare la macchina.")
 
             # Gestione Homing
             elif "HOMING_COMPLETED" in status_message or "HOMED" in status_message:
@@ -474,10 +490,41 @@ class MainWindow(QMainWindow):
             self.send_limits_to_firmware()
             
             # Messaggio di conferma per l'utente
-            QMessageBox.information(self, "Limiti Impostati", 
+            QMessageBox.information(self, "Limiti Impostati",
                                     f"Nuovi limiti macchina inviati:\n"
                                     f"- Forza Massima: {new_force_N:.3f} N\n"
                                     f"- Spostamento Massimo: {new_disp_mm:.4f} mm")
+
+    def send_filter_config_to_firmware(self):
+        """
+        Costruisce e invia al firmware il comando SET_FILTER_CONFIG usando
+        la configurazione filtro corrente (self.current_filter_alpha /
+        self.current_filter_rate_sps / self.current_filter_pga_gain).
+        """
+        command = (f"SET_FILTER_CONFIG:ALPHA={self.current_filter_alpha:.3f};"
+                   f"RATE={self.current_filter_rate_sps};GAIN={self.current_filter_pga_gain}")
+        self.communicator.send_command(command)
+
+    def show_filter_dialog(self):
+        """
+        Mostra la finestra di dialogo per configurare il filtro EMA della
+        cella di carico e invia il comando al firmware.
+        """
+        dialog = FilterConfigDialog(self.current_filter_alpha, self.current_filter_rate_sps,
+                                     self.current_filter_pga_gain, self)
+        if dialog.exec():
+            new_alpha, new_rate_sps, new_gain = dialog.get_values()
+            self.current_filter_alpha = new_alpha
+            self.current_filter_rate_sps = new_rate_sps
+            self.current_filter_pga_gain = new_gain
+            self.settings['filter_config'] = {"alpha": new_alpha, "rate_sps": new_rate_sps, "gain": new_gain}
+            self.settings_manager.save_settings(self.settings)
+            self.send_filter_config_to_firmware()
+            QMessageBox.information(self, "Filtro Configurato",
+                                    f"Nuova configurazione filtro inviata:\n"
+                                    f"- Alpha: {new_alpha:.2f}\n"
+                                    f"- Sample Rate: {new_rate_sps} SPS\n"
+                                    f"- Guadagno PGA: {new_gain}x")
 
 
 
