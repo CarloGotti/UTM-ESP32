@@ -8,8 +8,8 @@ trazione/compressione da laboratorio:
 - **Controllo-Macchina-ESP32** (`c:\Users\carlo\Documents\PlatformIO\Projects\Controllo-Macchina-ESP32`,
   cartella secondaria del workspace) — firmware C++ (PlatformIO/Arduino) che gira
   sull'ESP32, un unico file `src/main.cpp` (~1220 righe). Pilota un motore passo-passo
-  (vite senza fine), legge una cella di carico via HX711 e opzionalmente un LCR-meter
-  esterno via UART2.
+  (vite senza fine), legge una cella di carico via NAU7802 (ADC I2C, libreria SparkFun
+  Qwiic Scale NAU7802) e opzionalmente un LCR-meter esterno via UART2.
 
 Sono due repository git separati e indipendenti.
 
@@ -27,12 +27,21 @@ Sono due repository git separati e indipendenti.
     il posto dove viene **guidata la sequenza a blocchi del test ciclico**: alla
     ricezione di `STATUS:BLOCK_COMPLETED` costruisce e invia il comando per il blocco
     successivo di `CyclicTestWidget.test_sequence` (vedi sotto). Il firmware non sa
-    nulla della sequenza intera: la logica multi-blocco vive tutta qui.
+    nulla della sequenza intera: la logica multi-blocco vive tutta qui. Gestisce anche
+    `STATUS:CALIBRATION_INVALIDATED` (emesso dal firmware quando un cambio di guadagno
+    PGA reale invalida offset/scala correnti): resetta lo stato di calibrazione
+    mostrato in GUI e avvisa l'utente che deve ripetere Tara e Calibrazione.
   - Timer a 100 ms che invia `GET_DATA` in polling (usato solo quando non si è in
     streaming, cioè fuori da un test).
   - `current_force_limit_N` / `current_disp_limit_mm`: stato lato GUI dei limiti di
-    sicurezza assoluti, modificabile da `show_limits_dialog()` (vedi **Punti critici**
-    più sotto: questi valori NON sono automaticamente sincronizzati col firmware).
+    sicurezza assoluti, modificabile da `show_limits_dialog()` e reinviato al firmware
+    tramite `send_limits_to_firmware()` (automaticamente alla connessione e dopo ogni
+    calibrazione, vedi **Punti critici** più sotto, punto 3, risolto).
+  - `current_filter_alpha` / `current_filter_rate_sps` / `current_filter_pga_gain`:
+    stato lato GUI della configurazione del filtro EMA della cella di carico NAU7802
+    (alpha, sample rate, guadagno PGA), caricati/persistiti in `settings.json` e
+    reinviati al firmware con `send_filter_config_to_firmware()` (comando
+    `SET_FILTER_CONFIG`, vedi sotto), modificabili da `show_filter_dialog()`.
 
 - **`communication.py`** — `SerialCommunicator(QObject)`: worker che vive nel thread
   seriale. Loop principale (`run()`): consuma una coda (`Queue`) di comandi in uscita
@@ -70,14 +79,21 @@ Sono due repository git separati e indipendenti.
   (Load-Displacement / Stress-Strain per monotonici, Time-Displacement /
   Time-Load per ciclici).
 
-- **`settings_manager.py`** — persistenza JSON (`settings.json`) dei soli carichi di
-  calibrazione (`cal_loads`) per cella. Nota: la "calibrazione attiva" (fattore di
-  scala) è invece salvata/caricata come file JSON separato scelto dall'utente tramite
-  `CalibrationWidget`, non tramite `SettingsManager`.
+- **`settings_manager.py`** — persistenza JSON (`settings.json`) dei carichi di
+  calibrazione (`cal_loads`) per cella e della configurazione del filtro EMA della
+  cella di carico (`filter_config`: alpha, sample rate, guadagno PGA — default
+  0.5/320 SPS/128x). Nota: la "calibrazione attiva" (fattore di scala) è invece
+  salvata/caricata come file JSON separato scelto dall'utente tramite
+  `CalibrationWidget`, non tramite `SettingsManager`. Il merge dei default in
+  `load_settings()` è solo a livello di chiavi di primo livello: sotto-chiavi nuove
+  aggiunte a una chiave già esistente (com'è successo con `gain` dentro
+  `filter_config`) non vengono propagate automaticamente in un `settings.json`
+  preesistente.
 
 - **`custom_widgets.py`** — widget riusabili: `DisplayWidget` (etichetta + valore),
   `SpeedBarWidget` (barra colorata verde→giallo→rosso), `LimitsDialog` (form per
-  forza/spostamento massimi assoluti).
+  forza/spostamento massimi assoluti), `FilterConfigDialog` (form per alpha, sample
+  rate e guadagno PGA del filtro cella di carico).
 
 ### Flusso dati ad alto livello
 
@@ -132,6 +148,8 @@ d'emergenza, `send_emergency_stop()` (bypass coda).
 | `GET_SCALE` | — | Risponde `SCALE:<valore>` — **non risulta usato da nessun widget Python** |
 | `SET_SCALE:<factor>` | — | Usato da `CalibrationWidget.load_calibration()` |
 | `SET_LIMITS:FORCE_G=..;DISP_MM=..` | grammi, mm | Imposta `absolute_max_force_grams`/`absolute_max_pulse_count` |
+| `SET_FILTER_CONFIG:ALPHA=..;RATE=..;GAIN=..` | alpha∈[0.01,1.0], rate∈{10,20,40,80,320}, gain∈{1,2,4,8,16,32,64,128} | `GAIN` opzionale (retrocompatibilità). Rifiuta l'intero comando (`STATUS:FILTER_CONFIG_REJECTED;REASON=OUT_OF_RANGE`) se un campo è fuori range; nessuna applicazione parziale. Se `GAIN` cambia realmente, invalida offset/scala e riazzera l'EMA |
+| `GET_FILTER_CONFIG` | — | Risponde `STATUS:FILTER_CONFIG;ALPHA=..;RATE=..;GAIN=..` |
 | `RETURN_TO_START` | — | Torna alla posizione registrata a inizio test |
 | `START_TEST:SPEED_MMS=..;CRITERION=DISP\|FORCE;STOP_VAL=..` | | Avvia test monotonico |
 | `START_CYCLIC_TEST:MODE=DISP\|FORCE;UPPER=..;LOWER=..;SPEED=..;HOLD_U=..;HOLD_L=..;CYCLES=..` | | Avvia blocco ciclico |
@@ -168,7 +186,11 @@ alcun meccanismo che li tenga sincronizzati se uno dei due cambia.
   `HOMING_LIFTING`, `HOMING_COMPLETED`, `HOMED`, `TARE_DONE;OFFSET=..`,
   `CALIBRATION_DONE;SCALE=..`, `LIMITS_SET;MAX_FORCE_G=..;MAX_PULSES=..`,
   `MOVE_COMPLETED`, `RETURN_COMPLETED`, `RETURNING`, `MODE_SET`, `TIMER_RESET`,
-  `SCALE_SET`, `LCR_POLLING_ENABLED`/`DISABLED`, `STOPPED_BY_USER`.
+  `SCALE_SET`, `LCR_POLLING_ENABLED`/`DISABLED`, `STOPPED_BY_USER`,
+  `FILTER_CONFIG_SET;ALPHA=..;RATE=..;GAIN=..`, `FILTER_CONFIG_REJECTED;REASON=..`,
+  `FILTER_CONFIG;ALPHA=..;RATE=..;GAIN=..` (risposta a `GET_FILTER_CONFIG`),
+  `CALIBRATION_INVALIDATED;REASON=GAIN_CHANGED` (emesso quando un cambio di
+  guadagno PGA realmente diverso dal precedente resetta offset/scala).
 - **`SCALE:<valore>`** — risposta a `GET_SCALE`, mai richiesta da Python.
 - Righe di **debug non prefissate** (es. `"DEBUG: startMotor() chiamato"`,
   `"[DEBUG CMD] Calculated ramp_target_steps: ..."`, `"pulse_count: .."`) —
@@ -266,6 +288,17 @@ alcun meccanismo che li tenga sincronizzati se uno dei due cambia.
    corrente dal firmware, si fida solo del valore che ha impostato lei stessa
    (`SET_SCALE`) o del file di calibrazione caricato da disco.
 
+9. **Nessun rilevamento di saturazione del guadagno PGA del NAU7802.** Verificato
+   (leggendo l'API pubblica della libreria SparkFun Qwiic Scale NAU7802) che non
+   esiste alcun flag/metodo dedicato per rilevare quando l'ADC satura con un
+   guadagno troppo alto per il segnale in ingresso — solo un'idea di euristica
+   non implementata (controllare se `getReading()` si avvicina agli estremi
+   ±8388607 del range a 24 bit con segno). Con un guadagno alto (default 128x) e
+   un carico vicino al fondoscala della cella, una lettura saturata non verrebbe
+   segnalata come tale: si tradurrebbe in un valore di forza filtrato
+   silenziosamente scorretto (troncato), potenzialmente sotto-stimando il carico
+   reale proprio vicino al limite di sicurezza. Rischio noto, non mitigato.
+
 ## Inconsistenze note tra Python e firmware (riepilogo)
 
 | Aspetto | Python si aspetta | Firmware fa | Stato |
@@ -277,6 +310,9 @@ alcun meccanismo che li tenga sincronizzati se uno dei due cambia.
 | Salvataggio calibrazione su file | utente si aspetta che "Save Calibration" scriva un file | segnale emesso ma non collegato | ⚠️ **funzione silenziosamente rotta**, vedi punto 2 |
 | `GET_SCALE` | mai chiamato | implementato e funzionante | codice morto lato protocollo |
 | Costanti meccaniche (`PULSES_PER_REV`, `GEAR_RATIO`, `SCREW_PITCH_MM`) | copia locale in `main.py` | copia locale in `main.cpp` | coerenti oggi, nessun single source of truth |
+| Filtro cella di carico | si aspetta filtro EMA configurabile (alpha/rate/gain), non contatori anti-spike | EMA centralizzato, sostituisce i tre vecchi contatori anti-spike HX711 | ✅ **migrato**, vedi `CHANGELOG.md` (migrazione NAU7802) |
+| Guadagno PGA e calibrazione | si aspetta che un cambio gain invalidi automaticamente offset/scala | firmware invalida esplicitamente e notifica `STATUS:CALIBRATION_INVALIDATED` su cambio gain reale; GUI reagisce al messaggio (copre anche il reinvio automatico alla riconnessione) | ✅ **risolto**, vedi `CHANGELOG.md` (feature guadagno PGA) |
+| Saturazione del guadagno PGA | — | nessun rilevamento disponibile in libreria | ⚠️ **rischio noto, non mitigato**, vedi punto 9 |
 
 ## Manutenzione della documentazione
 
