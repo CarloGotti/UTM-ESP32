@@ -50,7 +50,11 @@ di configurazione del filtro della cella di carico.
   (`setRange(1.0, 190.0)`) codifica un **limite fisico della macchina**
   (corsa massima della vite) direttamente nella UI: se la corsa fisica
   cambia (nuova macchina, nuova vite), va aggiornato qui a mano; non è
-  derivato da nessuna costante condivisa con `main.py` o col firmware.
+  derivato da nessuna costante condivisa con `main.py` o col firmware. Lo
+  stesso valore `190.0` è duplicato anche in `goto_position_spinbox` di
+  `monotonic_test_widget.py`/`cyclic_test_widget.py` (range del controllo
+  "Go To", vedi `CHANGELOG.md`): un cambio della corsa fisica andrebbe
+  aggiornato in **tre** punti, non solo qui.
 - `DisplayWidget` non fa alcuna validazione o formattazione del testo che
   riceve: la responsabilità di formattare i numeri (decimali, unità,
   notazione scientifica per valori estremi) è interamente demandata ai

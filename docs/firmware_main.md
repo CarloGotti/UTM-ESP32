@@ -32,8 +32,10 @@ principali sono:
   coincide con esso —, `scale.setSampleRate(NAU7802_SPS_320)`,
   `scale.calibrateAFE()`, `scale.setCalibrationFactor(1.0)` — **nessun
   auto-zero**: la cella va sempre ri-tarata dopo ogni boot, invariato
-  rispetto a prima), e il timer hardware (`stepTimer`) che genera gli
-  impulsi di step via interrupt.
+  rispetto a prima), il timer hardware (`stepTimer`) che genera gli
+  impulsi di step via interrupt, e l'encoder incrementale esterno (pin
+  34/35/27, `attachInterrupt` su tutti e tre in modalità `CHANGE`, vedi
+  sotto).
 - **`loop()`**: gestisce il completamento di movimenti a passi contati
   (`move_completed_flag`), poi chiama in sequenza `handleSerialCommands()`,
   `handleDataStreaming()`, `updateMotorState()`, `updateLCRReading()`.
@@ -41,11 +43,16 @@ principali sono:
 - **`onStepTimer()`** (ISR, `IRAM_ATTR`): alterna il pin di step,
   incrementa/decrementa `pulse_count`, e decrementa `target_steps_remaining`
   per i movimenti a conteggio (homing, return-to-start, pre-posizionamento
-  ciclico), impostando `move_completed_flag` quando arriva a 0.
+  ciclico, `GOTO`), impostando `move_completed_flag` quando arriva a 0.
 - **`handleSerialCommands()`**: legge caratteri non bloccante da `Serial`;
   intercetta `'!'` **immediatamente**, prima di aspettare `'\n'`, per lo stop
   di emergenza; altrimenti accumula in `serial_buffer` (max 128 caratteri)
-  fino a `'\n'`, poi chiama `processCommand()`.
+  fino a `'\n'`, poi chiama `processCommand()`. Sia `'!'` sia il comando
+  `STOP` azzerano esplicitamente `target_steps_remaining` (oltre a fermare
+  subito i passi con `stopMotor()`): necessario perché un movimento a passi
+  contati interrotto a metà (es. `GOTO`) non lasci un residuo che
+  interferirebbe con il comando di movimento successivo (vedi
+  `CHANGELOG.md`).
 - **`processCommand(command)`**: dispatcher a catena di
   `if/else if command == ...` / `command.startsWith(...)`. Gestisce tutti i
   comandi elencati in `CLAUDE.md`, incluso
@@ -70,6 +77,18 @@ principali sono:
   I comandi con parametri (`START_CYCLIC_TEST`, `EXECUTE_RAMP`,
   `SET_LIMITS`, `START_TEST`, `SET_FILTER_CONFIG`) fanno parsing manuale
   con `indexOf`/`substring` (vedi Punti di attenzione).
+  `GOTO:<mm>` (posizione assoluta, sola andata, >= 0) è accettato con la
+  stessa condizione di `JOG_UP`/`JOG_DOWN`/`HOME`/`SET_SPEED`
+  (`!is_hardware_jog_active && motor_state == STOPPED`): converte mm in
+  passi assoluti (`PULSES_TO_MM`), calcola il delta rispetto a `pulse_count`
+  e riusa il meccanismo a passi contati già di `RETURN_TO_START`
+  (`target_steps_remaining`/`motor_enabled`), **senza introdurre un nuovo
+  `MotorState`** — `motor_state` resta `STOPPED` per tutta la durata del
+  movimento, esattamente come già avviene per `RETURN_TO_START`. I controlli
+  di sicurezza assoluti (`absolute_max_pulse_count`/`absolute_max_force_grams`
+  in `updateMotorState()`) e gli endstop si applicano automaticamente anche
+  a questo movimento, perché vengono valutati prima dell'uscita anticipata
+  legata a `target_steps_remaining > 0` (righe 906-909).
 - **`updateMotorState()`**: chiamata ad ogni `loop()`. In ordine:
   1. Controllo dei **limiti di sicurezza assoluti** (`absolute_max_pulse_count`,
      `absolute_max_force_grams`, quest'ultimo confrontato direttamente col
@@ -81,7 +100,13 @@ principali sono:
      bottom endstop durante l'homing.
   3. Macchina a stati dell'**homing** (`HOMING_FAST → HOMING_BACKOFF →
      HOMING_SLOW → HOMING_FINAL_LIFT`), che azzera `pulse_count` solo alla
-     fine.
+     fine. Nello stesso punto (fine `HOMING_FINAL_LIFT`, prima di
+     `STATUS:HOMING_COMPLETED`) azzera anche `encoder_position` ed
+     `encoder_z_turns`, dentro la stessa sezione critica
+     (`portENTER_CRITICAL(&encoder_mux)`) già usata da
+     `readEncoderPosition()`: l'homing esistente è quindi il punto di zero
+     comune per entrambi i canali di spostamento, senza alcun comando o
+     logica di homing separata per l'encoder.
   4. Verifica dello stop criterion del **test monotonico**
      (`CRITERION_DISP`/`CRITERION_FORCE`, confronto diretto sul valore
      filtrato per il ramo Forza).
@@ -108,7 +133,32 @@ principali sono:
   il PC — non esiste più un canale "raw" separato.
 - **`handleDataStreaming()`**: chiama `readLoadNonBlocking()` e, se
   `comms_mode == STREAMING`, emette un pacchetto `D:` ogni
-  `STREAM_INTERVAL_MS` (20 ms → 50 Hz) con il valore di carico già filtrato.
+  `STREAM_INTERVAL_MS` (20 ms → 50 Hz) con il valore di carico già filtrato,
+  incluso il 6° campo (conteggio encoder, vedi sotto).
+- **Encoder incrementale esterno** (Omron E6B2-CWZ6C, 1200 PPR, montato
+  direttamente sulla vite senza fine): decodifica in quadratura 4x via due
+  ISR (`handleEncoderChange()` su A/B, tabella di transizione
+  `ENCODER_QUAD_TABLE`) + conteggio giri su Z (`handleEncoderZChange()`,
+  fronte di discesa). Il contatore (`encoder_position`, 4800 conteggi/giro)
+  è letto in modo atomico da `readEncoderPosition()` tramite
+  `portENTER_CRITICAL`/`portMUX_TYPE` (necessario per la natura dual-core
+  dell'ESP32: le ISR possono girare su un core diverso da quello che
+  legge). **Canale di sola lettura (Livello 1)**: il valore letto viene
+  solo inserito come 6° campo del pacchetto `D:` (sia in streaming sia in
+  risposta a `GET_DATA`); non viene mai confrontato con `pulse_count`, non
+  influenza `updateMotorState()`, i limiti di sicurezza assoluti, né alcuno
+  stop criterion. `encoder_z_turns` (conteggio giri completi da Z) è
+  decodificato ma non ancora esposto sul protocollo seriale. **L'unico punto
+  in cui l'encoder interagisce con il resto del firmware** è la fine della
+  sequenza di homing (`HOMING_FINAL_LIFT`, subito prima di
+  `STATUS:HOMING_COMPLETED`): lo stesso punto che azzera `pulse_count` azzera
+  ora anche `encoder_position` ed `encoder_z_turns` (dentro la stessa
+  sezione critica di `readEncoderPosition()`), rendendo l'homing esistente
+  il punto di zero comune per entrambi i canali di spostamento — nessun
+  comando o macchina a stati di homing dedicata per l'encoder. Il modulo è
+  stato portato invariato
+  da uno sketch standalone di validazione, testato su hardware reale prima
+  dell'integrazione (risoluzione e linearità confermate fino a 2 giri).
 - **`TARE`/`CALIBRATE:<grammi>`**: entrambi mediano su una **finestra di
   tempo fissa di 1000 ms**, non su un numero fisso di campioni — il loop
   interroga `scale.available()` ogni ~2 ms (più spesso di quanto il NAU7802
@@ -194,6 +244,26 @@ principali sono:
   valore valido. L'unica euristica indiretta possibile (non implementata)
   sarebbe controllare se `scale.getReading()` si avvicina agli estremi del
   range a 24 bit con segno (~±8388607).
+- **Overhead delle ISR dell'encoder sul timing del `loop()`**: le due nuove
+  ISR (`handleEncoderChange()` su A e B, `handleEncoderZChange()` su Z)
+  si aggiungono a quella già esistente del timer di step
+  (`onStepTimer()`). Ognuna esegue poco lavoro (lettura di due pin,
+  lookup in tabella, una sezione critica breve), ma su un ESP32 già
+  impegnato con streaming dati, controllo motore e polling LCR
+  nello stesso `loop()`, un aumento della frequenza di transizione
+  dell'encoder (rotazione molto rapida della traversa) aumenta la
+  frequenza di interruzione del `loop()` principale. Non ancora misurato
+  l'impatto su `STREAM_INTERVAL_MS` con il nuovo carico di lavoro
+  reale — da validare se si osservano rallentamenti o jitter nello
+  streaming a velocità di traversa elevate.
+- **Conteggio encoder e riavvio dell'ESP32**: `encoder_position` è in RAM
+  volatile, non persistito. Un riavvio (reset hardware, power-cycle, o
+  anche il reset indotto dall'apertura della porta seriale — vedi
+  `CLAUDE.md`) azzera il conteggio, esattamente come già avviene per
+  `pulse_count`. Un ciclo di homing lo azzera anch'esso di nuovo
+  (vedi sopra): il confronto fra i due canali nei dati salvati ha quindi
+  senso a partire dall'ultimo homing (o dall'ultimo riavvio, se più
+  recente), non attraverso un riavvio senza homing successivo.
 - **Cambiare il guadagno PGA invalida la calibrazione esistente**: offset
   (`TARE`) e fattore di scala (`CALIBRATE`) sono validi solo al gain con
   cui sono stati determinati, perché i conteggi ADC grezzi per lo stesso

@@ -94,6 +94,10 @@ class DataSaver:
         ]
 
         headers.append("Resistance (Ohm)")
+        # Canale di misura aggiuntivo (encoder incrementale esterno, sola
+        # lettura): affiancato, non sostituisce, lo spostamento stimato a
+        # passi nelle colonne precedenti.
+        headers.append("Encoder Displacement (mm)")
 
         if is_cyclic:
             headers.extend(["Cycle", "Block"])
@@ -107,18 +111,23 @@ class DataSaver:
             resistance = np.nan
             cycle = np.nan
             block = np.nan
+            encoder_disp = np.nan
             time_s, rel_disp, rel_load, abs_disp, abs_load = data_row[:5]
 
             if is_cyclic:
-                # Tupla ciclica: (... cycle, block, resistance) - 8 elementi
-                if len(data_row) == 8: # <-- CONTROLLA LUNGHEZZA
+                # Tupla ciclica: (... cycle, block, resistance, encoder_disp) - 9 elementi
+                if len(data_row) == 9: # <-- CONTROLLA LUNGHEZZA
                     cycle = data_row[5]
                     block = data_row[6]
                     resistance = data_row[7] # <-- ESTRAE RESISTENZA DALL'INDICE 7
-            else: # Monotonico
-                # Tupla monotonica: (... resistance) - 6 elementi
-                if len(data_row) == 6: # <-- CONTROLLA LUNGHEZZA
+                    if data_row[8] is not None:
+                        encoder_disp = data_row[8] # <-- ESTRAE ENCODER DALL'INDICE 8
+            else: # Monotonico / registrazione manuale
+                # Tupla monotonica: (... resistance, encoder_disp) - 7 elementi
+                if len(data_row) == 7: # <-- CONTROLLA LUNGHEZZA
                     resistance = data_row[5] # <-- ESTRAE RESISTENZA DALL'INDICE 5
+                    if data_row[6] is not None:
+                        encoder_disp = data_row[6] # <-- ESTRAE ENCODER DALL'INDICE 6
 
             is_gauge_valid = isinstance(gauge, (int, float)) and not np.isnan(gauge) and gauge > 0
             is_area_valid = isinstance(area, (int, float)) and not np.isnan(area) and area > 0
@@ -135,9 +144,10 @@ class DataSaver:
             sheet.cell(row=current_excel_row, column=6, value=abs_disp)
             sheet.cell(row=current_excel_row, column=7, value=abs_load)
             sheet.cell(row=current_excel_row, column=8, value=resistance)
+            sheet.cell(row=current_excel_row, column=9, value=encoder_disp)
             if is_cyclic:
-                sheet.cell(row=current_excel_row, column=9, value=cycle)
-                sheet.cell(row=current_excel_row, column=10, value=block)
+                sheet.cell(row=current_excel_row, column=10, value=cycle)
+                sheet.cell(row=current_excel_row, column=11, value=block)
 
         num_data_points = len(test_data)
         if num_data_points == 0:

@@ -30,10 +30,21 @@ l'accesso alle schermate di test (`show_monotonic_test`/`show_cyclic_test` in
     è visibile, `handle_stream_data` ignora i dati e resetta
     `plot_start_time` a 0.
   - Registrazione: `on_rec_button_clicked()` accende/spegne `is_recording`;
-    mentre attiva, ogni chiamata a `handle_stream_data` accoda una tupla a 6
-    elementi in `recorded_data`. Allo stop, `_save_recorded_data()` costruisce
+    mentre attiva, ogni chiamata a `handle_stream_data` accoda una tupla a 7
+    elementi (incluso il canale encoder esterno, sola lettura) in
+    `recorded_data`. Allo stop, `_save_recorded_data()` costruisce
     un "provino fittizio" (gauge/area = `NaN`) e lo salva con `DataSaver`,
     riusando l'intera infrastruttura di export pensata per i test.
+  - **Canale encoder esterno (sola lettura)**: `encoder_displacement_offset_mm`
+    è lo zero relativo dedicato all'encoder, analogo a
+    `displacement_offset_mm` per lo spostamento a passi motore.
+    `zero_relative_displacement()` azzera **entrambi** con un solo click
+    (se `absolute_encoder_displacement_mm` è `None`, cioè nessun pacchetto
+    con encoder ancora ricevuto, l'offset encoder resta invariato).
+    `update_displays()` mostra il valore risultante in un nuovo
+    `DisplayWidget` ("Relative Enc. Displacement (mm)"), accanto a quello
+    assoluto già esistente; entrambi mostrano "N/A" finché non arriva un
+    pacchetto `D:` a 6 campi.
   - Resistenza LCR: `_on_lcr_checkbox_changed()` invia
     `ENABLE_LCR_POLLING`/`DISABLE_LCR_POLLING`; `_setup_resistance_axis()`
     crea/distrugge dinamicamente l'asse Y secondario (stessa logica,

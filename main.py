@@ -34,6 +34,11 @@ class MainWindow(QMainWindow):
 
         self.PULSES_PER_REV = 2000.0; self.GEAR_RATIO = 10.0; self.SCREW_PITCH_MM = 5.0873
         self.PULSES_TO_MM = self.SCREW_PITCH_MM / (self.PULSES_PER_REV * self.GEAR_RATIO)
+        # Encoder incrementale esterno (Omron E6B2-CWZ6C, 1200 PPR x4 = 4800
+        # conteggi/giro), montato direttamente sulla vite senza fine: nessun
+        # GEAR_RATIO di mezzo. Canale di misura aggiuntivo di sola lettura
+        # (Livello 1), non usato per nessuna decisione real-time.
+        self.ENCODER_COUNTS_PER_REV = 4800.0
         
         self.default_force_limit_N = 10.0
         self.current_force_limit_N = self.default_force_limit_N
@@ -288,10 +293,21 @@ class MainWindow(QMainWindow):
                 self.active_calibration_info = "Not Calibrated"
                 self.manual_control.set_calibration_status(self.active_calibration_info)
                 self.monotonic_test_widget.set_calibration_status(self.active_calibration_info)
+                self.calibration_widget.invalidate_calibration()
                 QMessageBox.warning(self, "Ricalibrazione Necessaria",
                                     f"Il firmware ha invalidato la calibrazione corrente "
                                     f"({status_message}).\n\n"
                                     f"Esegui Tara e Calibrazione prima di usare la macchina.")
+
+            # Gestione fine calibrazione: il firmware conferma il fattore di scala
+            # reale calcolato (risposta a CALIBRATE:<grammi>), che la GUI non conosce
+            # finché non arriva questo messaggio (necessario per "Save Calibration")
+            elif "CALIBRATION_DONE" in status_message:
+                try:
+                    scale_factor = float(status_message.split("SCALE=")[1])
+                    self.calibration_widget.set_calibration_factor(scale_factor)
+                except (IndexError, ValueError):
+                    print(f"Attenzione: impossibile interpretare il fattore di scala da '{status_message}'")
 
             # Gestione Homing
             elif "HOMING_COMPLETED" in status_message or "HOMED" in status_message:
@@ -308,6 +324,18 @@ class MainWindow(QMainWindow):
             # Altri messaggi di stato (es. TARE_DONE, CALIBRATION_DONE, etc.)
             # Vengono mostrati nella status bar ma non richiedono azioni specifiche qui.
 
+            # Qualunque messaggio che indica che il motore si è comunque
+            # fermato (fine movimento "Go To", endstop, limite di sicurezza)
+            # chiude lo stato "Go To in corso" sui widget di test, se non
+            # l'ha già fatto l'utente cliccando lui stesso il pulsante
+            # (che ora funge da STOP). Non è un elif: deve scattare in
+            # aggiunta alla gestione specifica già eseguita sopra per questi
+            # stessi messaggi (es. LIMIT_HIT, TOP_HIT/BOTTOM_HIT).
+            if any(code in status_message for code in
+                   ("MOVE_COMPLETED", "STOPPED_BY_USER", "TOP_HIT", "BOTTOM_HIT", "LIMIT_HIT")):
+                self.monotonic_test_widget.clear_goto_busy_state()
+                self.cyclic_test.clear_goto_busy_state()
+
             return # Fine gestione messaggi STATUS:
 
         # --- GESTIONE MESSAGGI DI DATI ('D:') ---
@@ -323,9 +351,17 @@ class MainWindow(QMainWindow):
                 time_s = 0.0
                 cycle_count = 0
                 resistance_ohm = -999.0 # Valore default/fallback
+                encoder_count = None # Assente sui pacchetti storici (< 6 campi)
 
                 # Parsing flessibile in base alla lunghezza
-                if len(parts) == 5: # Nuovo formato con LCR
+                if len(parts) == 6: # Formato con encoder esterno (Livello 1)
+                    load_str, disp_str, time_ms_str, cycle_str, res_str, enc_str = parts
+                    cycle_count = int(cycle_str)
+                    try: resistance_ohm = float(res_str)
+                    except ValueError: resistance_ohm = -2.0 # Errore parsing resistenza
+                    try: encoder_count = int(enc_str)
+                    except ValueError: encoder_count = None # Errore parsing encoder, tratta come assente
+                elif len(parts) == 5: # Formato con LCR, senza encoder (storico)
                     load_str, disp_str, time_ms_str, cycle_str, res_str = parts
                     cycle_count = int(cycle_str)
                     try: resistance_ohm = float(res_str)
@@ -339,7 +375,7 @@ class MainWindow(QMainWindow):
                     cycle_count = 0
                     # resistance_ohm rimane -999.0
                 else:
-                    raise ValueError(f"Pacchetto D: attesi 3, 4 o 5 valori, ricevuti {len(parts)}")
+                    raise ValueError(f"Pacchetto D: attesi 3, 4, 5 o 6 valori, ricevuti {len(parts)}")
 
                 # Parsing comune
                 load_grams = float(load_str)
@@ -347,6 +383,10 @@ class MainWindow(QMainWindow):
                 time_s = float(time_ms_str) / 1000.0
                 load_N = (load_grams / 1000.0) * 9.81
                 displacement_mm = pulse_count * self.PULSES_TO_MM
+                encoder_displacement_mm = (
+                    (encoder_count / self.ENCODER_COUNTS_PER_REV) * self.SCREW_PITCH_MM
+                    if encoder_count is not None else None
+                )
 
                 # --- AZIONI SPOSTATE QUI DENTRO ---
                 # Se siamo arrivati qui, il parsing è OK e tutte le variabili sono definite.
@@ -362,6 +402,8 @@ class MainWindow(QMainWindow):
                          widget.absolute_displacement_mm = displacement_mm
                     if hasattr(widget, 'current_resistance_ohm'):
                         widget.current_resistance_ohm = resistance_ohm
+                    if hasattr(widget, 'absolute_encoder_displacement_mm'):
+                        widget.absolute_encoder_displacement_mm = encoder_displacement_mm
 
                 # Calibrazione (caso speciale)
                 if hasattr(self.calibration_widget, 'abs_load_display'):
@@ -369,7 +411,7 @@ class MainWindow(QMainWindow):
 
                 # Chiama handle_stream_data del widget corrente (se esiste)
                 if hasattr(current_widget, 'handle_stream_data'):
-                    current_widget.handle_stream_data(load_N, displacement_mm, time_s, cycle_count, resistance_ohm)
+                    current_widget.handle_stream_data(load_N, displacement_mm, time_s, cycle_count, resistance_ohm, encoder_displacement_mm)
 
                 # Aggiorna i display del widget corrente (se esiste)
                 if hasattr(current_widget, 'update_displays'):

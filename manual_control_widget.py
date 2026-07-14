@@ -41,6 +41,8 @@ class ManualControlWidget(QWidget):
         self.is_homed = False; self.absolute_load_N = 0.0; self.load_offset_N = 0.0
         self.absolute_displacement_mm = 0.0; self.displacement_offset_mm = 0.0
         self.current_resistance_ohm = -999.0 # Per memorizzare l'ultimo valore LCR
+        self.absolute_encoder_displacement_mm = None # Canale encoder esterno (sola lettura, Livello 1)
+        self.encoder_displacement_offset_mm = 0.0 # Zero relativo del canale encoder
 
         general_font = QFont("Segoe UI", 12); button_font = QFont("Segoe UI", 12, QFont.Weight.Bold)
         minmax_font = QFont("Segoe UI", 8)
@@ -52,6 +54,8 @@ class ManualControlWidget(QWidget):
         self.calib_status_display = DisplayWidget("Active Calibration")
         self.calib_status_display.set_value("Not Calibrated")
         self.resistance_display = DisplayWidget("Resistance (Ω)")
+        self.encoder_disp_display = DisplayWidget("Encoder Displacement (mm)")
+        self.rel_encoder_disp_display = DisplayWidget("Relative Enc. Displacement (mm)")
 
         self.up_button = QPushButton("↑ UP ↑"); self.down_button = QPushButton("↓ DOWN ↓")
         
@@ -114,6 +118,8 @@ class ManualControlWidget(QWidget):
         display_layout.addWidget(self.rel_load_display); display_layout.addWidget(self.abs_disp_display)
         display_layout.addWidget(self.rel_disp_display)
         display_layout.addWidget(self.resistance_display)
+        display_layout.addWidget(self.encoder_disp_display)
+        display_layout.addWidget(self.rel_encoder_disp_display)
         left_vbox = QVBoxLayout(); speed_label_title = QLabel("Jog Speed:"); speed_label_title.setFont(general_font)
         left_vbox.addWidget(self.up_button); left_vbox.addWidget(self.down_button); left_vbox.addSpacing(20)
         left_vbox.addWidget(speed_label_title); left_vbox.addWidget(self.speed_spinbox); left_vbox.addWidget(self.speed_bar)
@@ -166,12 +172,13 @@ class ManualControlWidget(QWidget):
         # --- FINE ---
         self.update_displays(); self.update_speed_controls()
 
-    def handle_stream_data(self, load_N, disp_mm, time_s, cycle_count, resistance_ohm):
+    def handle_stream_data(self, load_N, disp_mm, time_s, cycle_count, resistance_ohm, encoder_disp_mm=None):
              # Se la schermata non è visibile, non fare nulla
         if not self.isVisible():
             self.plot_start_time = 0 # Resetta il tempo se la schermata viene nascosta
             return
         self.current_resistance_ohm = resistance_ohm
+        self.absolute_encoder_displacement_mm = encoder_disp_mm
 
         # Inizializza il tempo di partenza al primo dato ricevuto
         if self.plot_start_time == 0:
@@ -192,7 +199,7 @@ class ManualControlWidget(QWidget):
         if self.is_recording:
             relative_disp = disp_mm - self.displacement_offset_mm
             relative_load = load_N - self.load_offset_N
-            self.recorded_data.append((elapsed_time, relative_disp, relative_load, disp_mm, load_N, resistance_ohm))
+            self.recorded_data.append((elapsed_time, relative_disp, relative_load, disp_mm, load_N, resistance_ohm, encoder_disp_mm))
 
     # Aggiungi questo nuovo metodo privato alla classe
     def _update_plot(self):
@@ -341,7 +348,11 @@ class ManualControlWidget(QWidget):
         self.is_homing_active = False
         
     def zero_relative_load(self): self.load_offset_N = self.absolute_load_N; self.update_displays()
-    def zero_relative_displacement(self): self.displacement_offset_mm = self.absolute_displacement_mm; self.update_displays()
+    def zero_relative_displacement(self):
+        self.displacement_offset_mm = self.absolute_displacement_mm
+        if self.absolute_encoder_displacement_mm is not None:
+            self.encoder_displacement_offset_mm = self.absolute_encoder_displacement_mm
+        self.update_displays()
     def set_speed(self): self.send_command(f"SET_SPEED:{self.speed_spinbox.value():.2f}")
     def update_speed_controls(self):
         self.set_speed()
@@ -372,6 +383,13 @@ class ManualControlWidget(QWidget):
                 display_text = f"{res_value:.4f}"
         #print(f"DEBUG GUI UpdateDisp ({type(self).__name__}): self.current_resistance_ohm = {self.current_resistance_ohm}, display_text = '{display_text}'")
         self.resistance_display.set_value(display_text)
+        if self.absolute_encoder_displacement_mm is None:
+            self.encoder_disp_display.set_value("N/A")
+            self.rel_encoder_disp_display.set_value("N/A")
+        else:
+            self.encoder_disp_display.set_value(f"{self.absolute_encoder_displacement_mm:.4f}")
+            relative_encoder_disp = self.absolute_encoder_displacement_mm - self.encoder_displacement_offset_mm
+            self.rel_encoder_disp_display.set_value(f"{relative_encoder_disp:.4f}")
 
     def _on_lcr_checkbox_changed(self, state):
         """ Invia il comando appropriato all'ESP32 quando il checkbox cambia stato. """

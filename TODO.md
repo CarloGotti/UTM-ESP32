@@ -69,6 +69,12 @@ risoluzione temporale più alta.
    (lettura I2C del NAU7802, controllo motore, polling LCR) dovrebbe restare
    sotto ~3ms con margine sufficiente. Probabile che regga (le operazioni
    I2C sono nell'ordine delle centinaia di µs), ma va misurato, non assunto.
+   Dall'integrazione dell'encoder incrementale esterno (vedi `CHANGELOG.md`)
+   il `loop()` ha anche due nuove ISR (`handleEncoderChange()` su A/B,
+   `handleEncoderZChange()` su Z) che si aggiungono a quella del timer di
+   step: il loro overhead a velocità di traversa elevate non è stato
+   ancora misurato, quindi la validazione di `STREAM_INTERVAL_MS` andrebbe
+   rifatta tenendone conto, non solo del carico NAU7802.
 3. **Il costo reale è lato Python/GUI, non sul firmware o sul cavo**:
    - `handle_data_from_esp32()` → `handle_stream_data()` farebbe ~6.4×
      più `append()` sulla lista dati e più `setData()` su curve pyqtgraph
@@ -89,10 +95,29 @@ di export) più che sul firmware o sul cavo. Da affrontare solo se serve
 davvero una risoluzione temporale più alta per l'analisi dei dati; non è
 un prerequisito della migrazione NAU7802 già completata.
 
+## Conteggio giri Z dell'encoder esterno, decodificato ma non esposto
+
+**Stato attuale**: l'integrazione dell'encoder incrementale esterno (vedi
+`CHANGELOG.md`) decodifica anche il canale Z (indice, un impulso a giro)
+in `encoder_z_turns`, azzerato insieme a `encoder_position` a fine homing,
+ma **non è esposto sul protocollo seriale** — nessun campo `D:` lo porta al
+PC, nessun comando lo legge. È stato lasciato decodificato "per un
+eventuale uso futuro" senza che quell'uso sia stato ancora definito.
+
+**Possibili usi futuri** (non pianificati, solo idee raccolte durante
+l'integrazione):
+- Verifica di coerenza fra `encoder_z_turns` e lo spostamento stimato
+  (giri interi attesi vs. giri effettivamente contati), come controllo
+  indipendente di eventuali passi persi dal motore.
+- Un homing/zero dedicato per l'encoder che non dipenda dalla sequenza di
+  homing esistente basata sugli endstop meccanici.
+
+Se nessuno di questi usi si materializza, valutare se rimuovere del tutto
+la decodifica Z (oggi codice morto lato funzionalità, anche se a costo
+quasi nullo) per ridurre la superficie del firmware.
+
 ## Altri punti aperti (dai `docs/*.md` e da `CLAUDE.md`)
 
-- "Save Calibration" non salva nulla (`calibration_widget.py`, segnale
-  `save_calibration_requested` non collegato a nessuno slot).
 - `current_force_limit_N` / `current_disp_limit_mm` non sono persistiti su
   disco: si perdono alla chiusura dell'app Python (tornano al default
   hardcoded), a differenza di `cal_loads` che è salvato in `settings.json`.

@@ -58,15 +58,17 @@ class CalibrationWidget(QWidget):
     back_to_menu_requested = pyqtSignal()
     calibration_updated = pyqtSignal(str, str)
     settings_changed = pyqtSignal(dict)
-    
-    # NUOVO: Segnale per richiedere il salvataggio
-    save_calibration_requested = pyqtSignal(str)
 
     def __init__(self, communicator, cal_loads, parent=None):
         super().__init__(parent)
         self.communicator = communicator
         self.cal_loads = cal_loads
         self.calibration_state = "IDLE"
+        # Fattore di scala corrente noto alla GUI: None finché il firmware non
+        # lo conferma (STATUS:CALIBRATION_DONE, dopo CALIBRATE) o non viene
+        # caricato da file (load_calibration()). Necessario per poter
+        # scrivere qualcosa in save_calibration().
+        self.current_calibration_factor = None
         
         button_font = QFont("Segoe UI", 12, QFont.Weight.Bold)
         label_font = QFont("Segoe UI", 12)
@@ -143,7 +145,10 @@ class CalibrationWidget(QWidget):
             self.calibration_state = "IDLE"
             self.status_label.setText("Calibrazione completata!")
             self.start_cal_button.setText("Start Calibration")
-            self.save_cal_button.setEnabled(True)
+            # Il fattore di scala reale arriva in modo asincrono dal firmware
+            # (STATUS:CALIBRATION_DONE;SCALE=..): "Save Calibration" resta
+            # disabilitato finché non arriva (vedi set_calibration_factor(),
+            # chiamato da MainWindow).
             self.calibration_updated.emit("Just Calibrated", selected_cell)
 
     def show_set_loads_dialog(self):
@@ -155,14 +160,45 @@ class CalibrationWidget(QWidget):
                 self.settings_changed.emit(self.cal_loads)
 
     def save_calibration(self):
+        if self.current_calibration_factor is None:
+            self.status_label.setText(
+                "Nessun fattore di calibrazione disponibile da salvare.\n"
+                "Esegui una calibrazione o caricane una da file prima."
+            )
+            return
         selected_cell = self.cell_selector.currentText()
         today_date = datetime.now().strftime("%Y-%m-%d")
         default_filename = f"cal_{selected_cell}_{today_date}.json"
         filePath, _ = QFileDialog.getSaveFileName(self, "Salva Calibrazione", default_filename, "Calibration Files (*.json)")
         if filePath:
-            # Emette il segnale per dire a MainWindow di gestire il salvataggio
-            self.save_calibration_requested.emit(filePath)
-    
+            data = {
+                "cell_name": selected_cell,
+                "calibration_factor": self.current_calibration_factor,
+                "saved_at": datetime.now().isoformat(),
+            }
+            try:
+                with open(filePath, 'w') as f:
+                    json.dump(data, f, indent=2)
+                filename = filePath.split('/')[-1]
+                self.status_label.setText(f"Calibrazione salvata in:\n{filename}")
+            except IOError as e:
+                self.status_label.setText(f"Errore salvataggio file: {e}")
+
+    def set_calibration_factor(self, scale_factor):
+        """ Chiamato da MainWindow quando il fattore di scala corrente diventa
+        noto: dopo STATUS:CALIBRATION_DONE;SCALE=.. (risposta a CALIBRATE) o
+        subito dopo aver inviato SET_SCALE da load_calibration(). """
+        self.current_calibration_factor = scale_factor
+        self.save_cal_button.setEnabled(True)
+
+    def invalidate_calibration(self):
+        """ Chiamato da MainWindow quando il firmware invalida la calibrazione
+        corrente (STATUS:CALIBRATION_INVALIDATED, es. dopo un cambio di
+        guadagno PGA reale): il fattore di scala noto qui non è più valido. """
+        self.current_calibration_factor = None
+        self.save_cal_button.setEnabled(False)
+        self.status_label.setText("Calibrazione invalidata (cambio guadagno PGA). Ripetere Tara e Calibrazione.")
+
     def load_calibration(self):
         filePath, _ = QFileDialog.getOpenFileName(self, "Carica Calibrazione", "", "Calibration Files (*.json)")
         if filePath:
@@ -175,7 +211,7 @@ class CalibrationWidget(QWidget):
                     self.communicator.send_command(f"SET_SCALE:{scale_factor}")
                     filename = filePath.split('/')[-1]
                     self.status_label.setText(f"Calibrazione caricata da:\n{filename}")
-                    self.save_cal_button.setEnabled(True)
+                    self.set_calibration_factor(scale_factor)
                     try:
                         cell_name_from_file = filename.split('_')[1]
                     except IndexError:

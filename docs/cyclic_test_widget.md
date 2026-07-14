@@ -25,9 +25,26 @@ della sequenza: il proseguimento ai blocchi successivi è pilotato da
   - Segnali: `back_to_menu_requested`, `limits_button_requested`.
   - Stato: `test_sequence` (lista di blocchi, ognuno un dict con almeno
     `"type"` ∈ `{"cyclic","pause","ramp"}`), `current_block_index`,
-    `specimens`, `current_specimen_name`, `current_test_data` (tuple a 8
+    `specimens`, `current_specimen_name`, `current_test_data` (tuple a 9
     elementi: `time_s, rel_disp, rel_load, abs_disp, abs_load, cycle_count,
-    block_num, resistance_ohm`).
+    block_num, resistance_ohm, encoder_disp_mm` — l'ultimo è l'encoder
+    **assoluto**, non relativo), `absolute_encoder_displacement_mm` (canale
+    dell'encoder incrementale esterno, sola lettura — `None` se il pacchetto
+    `D:` non lo include), `encoder_displacement_offset_mm` (zero relativo
+    dedicato all'encoder, azzerato insieme a `displacement_offset_mm` da
+    `zero_relative_displacement()`; usato per calcolare al volo lo
+    spostamento encoder relativo, non è mai salvato nella tupla),
+    `is_goto_active` (True mentre un movimento "Go To" è in corso).
+  - **"Go To" (posizione assoluta)**: identico a `monotonic_test_widget.py`
+    — `goto_position_spinbox` (mm, range `[0, 190]`) + `goto_button` accanto
+    a Up/Down/Jog Speed, `toggle_goto()`/`_cancel_goto()`/
+    `clear_goto_busy_state()` con lo stesso pattern a due stati
+    "GO TO"/"STOP" (vedi `docs/monotonic_test_widget.md` per il dettaglio, e
+    `CLAUDE.md` per il comando firmware `GOTO:<mm>`). Il pulsante STOP
+    principale (`self.stop_button`) interrompe anche un Go To, oltre a un
+    test: `on_stop_test()` chiama `_cancel_goto()` se `is_goto_active`, e
+    `update_ui_for_test_state()` lo tiene abilitato in quel caso (era il bug
+    segnalato dall'utente — vedi `CHANGELOG.md`).
   - `on_add_block()` / `on_add_ramp()`: aprono il dialog corrispondente,
     convertono i valori grezzi in unità base (mm o N) con
     `convert_stop_criterion()`/`convert_speed()`, **validano contro i limiti
@@ -52,8 +69,22 @@ della sequenza: il proseguimento ai blocchi successivi è pilotato da
     `AUTOSAVE_CYCLIC_<nome>_<timestamp>.xlsx`, includendo anche
     `test_sequence` come `"test_sequence_setup"` per la descrizione testuale
     nel file Excel.
-  - `handle_stream_data(...)`: aggiorna stato, accoda dati (tupla a 8
-    elementi), aggiorna la curva principale e quella di resistenza.
+  - `handle_stream_data(...)`: aggiorna stato, accoda dati (tupla a 9
+    elementi, incluso il canale encoder esterno in coda), aggiorna la/e
+    curva/e live (una per sorgente X attiva, vedi sotto) e quella di
+    resistenza.
+  - **Sorgente X del grafico (Motor/Encoder)**: stessa logica di
+    `monotonic_test_widget.py` — due checkbox (`x_source_motor_checkbox`,
+    `x_source_encoder_checkbox`), visibili solo con `x_axis_combo` su
+    "Relative Displacement (mm)" (`_update_x_source_controls_visibility()`,
+    `_active_x_sources()`, `_on_x_source_changed()` con lo stesso guard
+    anti-doppia-deselezione). L'asse Y resta sempre basato sul canale
+    motore, indipendentemente dalla sorgente X scelta (anche nei rari casi
+    in cui l'utente mette displacement/strain anche su Y). La curva **live**
+    non è più un singolo `self.plot_curve` ma `self.live_curves` (dict
+    sorgente→curva, gestito da `_create_live_curve()`); `self.plot_curves`
+    (overlay dei provini storici) è indicizzato da tuple
+    `(nome_provino, sorgente)` invece che dal solo nome.
   - `_calculate_estimated_duration()`: **simula** la sequenza (posizione
     corrente, tempi di riposizionamento tra blocchi, tempi di ciclo/rampa)
     per stimare la durata totale, ma solo se **tutti** i blocchi sono basati
@@ -64,9 +95,10 @@ della sequenza: il proseguimento ai blocchi successivi è pilotato da
     guardie `gauge_length <= 0` / `area <= 0` leggermente più difensive) a
     quelle in `monotonic_test_widget.py`.
   - `refresh_plot()`: come nel monotonico, gestisce anche l'asse secondario
-    per la resistenza; in più ricrea sempre una curva live dedicata
-    (`self.plot_curve`, con stile tratteggiato) alla fine della funzione,
-    perché lo streaming ciclico può durare a lungo attraverso più blocchi.
+    per la resistenza; in più ricrea sempre una o due curve live dedicate
+    (`self.live_curves`, stile tratteggiato per la sorgente motore, punteggiato
+    per l'encoder) alla fine della funzione, perché lo streaming ciclico può
+    durare a lungo attraverso più blocchi.
 
 ## Dipendenze
 

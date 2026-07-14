@@ -343,6 +343,9 @@ class CyclicTestWidget(QWidget):
         self.current_specimen_name = None # Aggiunto per gestione batch
         self.current_test_data = []
         self.current_resistance_ohm = -999.0 # Per memorizzare l'ultimo valore LCR
+        self.absolute_encoder_displacement_mm = None # Canale encoder esterno (sola lettura, Livello 1)
+        self.encoder_displacement_offset_mm = 0.0 # Zero relativo del canale encoder
+        self.is_goto_active = False # True mentre un movimento "Go To" è in corso
         # --- FONT E LOCALE ---
         general_font = QFont("Segoe UI", 11)
         button_font = QFont("Segoe UI", 10, QFont.Weight.Bold)
@@ -362,6 +365,8 @@ class CyclicTestWidget(QWidget):
         self.time_display = DisplayWidget("Elapsed Time (s)")
         self.current_block_display = DisplayWidget("Current Block")
         self.resistance_display = DisplayWidget("Resistance (Ω)") # <-- NUOVO DISPLAY
+        self.encoder_disp_display = DisplayWidget("Encoder Displacement (mm)")
+        self.rel_encoder_disp_display = DisplayWidget("Relative Enc. Displacement (mm)")
         self.lcr_enable_checkbox = QCheckBox("Enable LCR Reading")
 
         top_section_layout.addWidget(self.abs_load_display)
@@ -372,6 +377,8 @@ class CyclicTestWidget(QWidget):
         top_section_layout.addWidget(self.time_display)
         top_section_layout.addWidget(self.current_block_display)
         top_section_layout.addWidget(self.resistance_display)
+        top_section_layout.addWidget(self.encoder_disp_display)
+        top_section_layout.addWidget(self.rel_encoder_disp_display)
         top_section_layout.addStretch(1)
         top_section_layout.addWidget(self.lcr_enable_checkbox)
 
@@ -390,6 +397,24 @@ class CyclicTestWidget(QWidget):
         jog_controls_layout.addWidget(self.up_button)
         jog_controls_layout.addWidget(self.down_button)
         jog_controls_layout.addLayout(jog_speed_layout)
+
+        # --- "Go To": movimento verso una posizione assoluta (>= 0), alla
+        # velocità di Jog Speed corrente. Il pulsante stesso diventa "STOP"
+        # mentre il movimento è in corso (stesso pattern di HOMING in
+        # manual_control_widget.py).
+        goto_layout = QHBoxLayout()
+        self.goto_position_spinbox = QDoubleSpinBox()
+        self.goto_position_spinbox.setLocale(locale_c)
+        self.goto_position_spinbox.setSuffix(" mm")
+        self.goto_position_spinbox.setFixedWidth(100)
+        self.goto_position_spinbox.setDecimals(4)
+        self.goto_position_spinbox.setRange(0.0, 190.0)  # limite fisico macchina
+        self.goto_button = QPushButton("GO TO"); self.goto_button.setFont(button_font)
+        goto_layout.addWidget(QLabel("Go to:"))
+        goto_layout.addWidget(self.goto_position_spinbox)
+        goto_layout.addWidget(self.goto_button)
+        jog_controls_layout.addLayout(goto_layout)
+
         # Aggiungi il layout dei controlli jog al layout superiore
         top_section_layout.addLayout(jog_controls_layout)
 
@@ -405,20 +430,31 @@ class CyclicTestWidget(QWidget):
         self.plot_widget = pg.PlotWidget()
         self.plot_widget.setBackground('w'); self.plot_widget.showGrid(x=True, y=True)
         self.plot_widget.setLabel('left', 'Relative Load (N)'); self.plot_widget.setLabel('bottom', 'Relative Displacement (mm)')
-        self.plot_curve = self.plot_widget.plot(pen=pg.mkPen('b', width=2))
+        self.live_curves = {}  # dict: source ("motor"/"encoder") -> curva live corrente
 
         self.resistance_axis_viewbox = None # La ViewBox per la resistenza
         self.resistance_axis_item = None    # L'AxisItem a destra
         self.resistance_curve = None
 
-        
+
         graph_controls_layout = QHBoxLayout()
         self.x_axis_combo = QComboBox(); self.x_axis_combo.addItems(["Relative Displacement (mm)", "Time (s)", "Strain (%)"])
         self.y_axis_combo = QComboBox(); self.y_axis_combo.addItems(["Relative Load (N)", "Stress (MPa)", "Relative Displacement (mm)", "Strain (%)"])
+
+        # Sorgente del canale di spostamento usato sull'asse X quando è
+        # selezionato "Relative Displacement (mm)" (vedi CHANGELOG.md).
+        self.x_source_motor_checkbox = QCheckBox("Motor")
+        self.x_source_motor_checkbox.setChecked(True)
+        self.x_source_encoder_checkbox = QCheckBox("Encoder")
+        self.x_source_encoder_checkbox.setChecked(False)
+        self.x_source_motor_checkbox.stateChanged.connect(self._on_x_source_changed)
+        self.x_source_encoder_checkbox.stateChanged.connect(self._on_x_source_changed)
+
         self.overlay_checkbox = QCheckBox("Overlay previous tests")
         self.reset_zoom_button = QPushButton("Reset Zoom")
-        
+
         graph_controls_layout.addWidget(QLabel("X-Axis:")); graph_controls_layout.addWidget(self.x_axis_combo, 1)
+        graph_controls_layout.addWidget(self.x_source_motor_checkbox); graph_controls_layout.addWidget(self.x_source_encoder_checkbox)
         graph_controls_layout.addWidget(QLabel("Y-Axis:")); graph_controls_layout.addWidget(self.y_axis_combo, 1)
         graph_controls_layout.addStretch(1)
         graph_controls_layout.addWidget(self.overlay_checkbox)
@@ -571,14 +607,17 @@ class CyclicTestWidget(QWidget):
         self.down_button.pressed.connect(self.start_moving_down)
         self.down_button.released.connect(self.stop_moving)
         self.jog_speed_spinbox.valueChanged.connect(self.set_speed)
+        self.goto_button.clicked.connect(self.toggle_goto)
         # Aggiorna il grafico se cambiano gli assi
         self.x_axis_combo.currentIndexChanged.connect(self.refresh_plot)
         self.y_axis_combo.currentIndexChanged.connect(self.refresh_plot)
+        self.x_axis_combo.currentIndexChanged.connect(self._update_x_source_controls_visibility)
         self.lcr_enable_checkbox.stateChanged.connect(self._on_lcr_checkbox_changed)
 
         self.update_ui_for_test_state()
         self.update_displays()
         self._update_sequence_buttons_state()
+        self._update_x_source_controls_visibility()
 
     # --- Metodi Placeholder per la Logica ---
 
@@ -693,10 +732,18 @@ class CyclicTestWidget(QWidget):
     def on_stop_test(self, user_initiated=True):
         print(f"DEBUG Cyclic: on_stop_test chiamato (user_initiated={user_initiated})")
 
+        # Il pulsante STOP principale deve poter interrompere anche un
+        # movimento "Go To" in corso, non solo un test (era il bug segnalato:
+        # restava disabilitato/inefficace durante un Go To, vedi CHANGELOG.md)
+        if self.is_goto_active:
+            self._cancel_goto()
+            if not self.is_test_running:
+                return
+
         # Se il test non è in corso, non fare nulla
         if not self.is_test_running:
             return
-            
+
         # Se lo stop è avviato dall'utente (click), invia i comandi di stop.
         if user_initiated:
             print("DEBUG Cyclic: Invio stop emergenza dall'utente")
@@ -749,7 +796,7 @@ class CyclicTestWidget(QWidget):
         self.refresh_plot()
         # --- FINE CORREZIONE ---
     
-    def handle_stream_data(self, load_N, disp_mm, time_s, cycle_count, resistance_ohm):
+    def handle_stream_data(self, load_N, disp_mm, time_s, cycle_count, resistance_ohm, encoder_disp_mm=None):
         if not self.is_test_running:
             return
 
@@ -759,54 +806,67 @@ class CyclicTestWidget(QWidget):
         self.elapsed_time_s = time_s
         self.current_cycle = cycle_count
         self.current_resistance_ohm = resistance_ohm
+        self.absolute_encoder_displacement_mm = encoder_disp_mm
         relative_disp = disp_mm - self.displacement_offset_mm
         relative_load = load_N - self.load_offset_N
 
-        # 2. Aggiunge dati (invariato)
+        # 2. Aggiunge dati (canale encoder in coda, accanto allo spostamento a passi)
         current_block_num = self.current_block_index + 1
-        self.current_test_data.append((time_s, relative_disp, relative_load, disp_mm, load_N, cycle_count, current_block_num, resistance_ohm))
+        self.current_test_data.append((time_s, relative_disp, relative_load, disp_mm, load_N, cycle_count, current_block_num, resistance_ohm, encoder_disp_mm))
 
         # 3. Aggiorna il grafico
-        specimen = self.specimens.get(self.current_specimen_name, 
-                                     {"gauge_length": 1.0, "area": 1.0}) 
+        specimen = self.specimens.get(self.current_specimen_name,
+                                     {"gauge_length": 1.0, "area": 1.0})
         area = specimen.get("area", 1.0)
         gauge = specimen.get("gauge_length", 1.0)
         x_mode = self.x_axis_combo.currentText()
         y_mode = self.y_axis_combo.currentText()
+        active_sources = self._active_x_sources()
 
         # Estrai dati (invariato)
         times = [p[0] for p in self.current_test_data]
-        x_raw_data = [p[1] for p in self.current_test_data] 
+        x_raw_motor = [p[1] for p in self.current_test_data]  # spostamento relativo a passi motore
         y_raw_data = [p[2] for p in self.current_test_data]
 
-        # Converte X (invariato)
-        if "Strain" in x_mode and gauge > 0: x_data_final = [(d / gauge) * 100 for d in x_raw_data]
-        elif "Time" in x_mode: x_data_final = times
-        else: x_data_final = x_raw_data
+        def compute_x(source):
+            if source == "encoder":
+                raw = [
+                    (p[8] - self.encoder_displacement_offset_mm) if len(p) > 8 and p[8] is not None else np.nan
+                    for p in self.current_test_data
+                ]
+            else:
+                raw = x_raw_motor
+            if "Strain" in x_mode and gauge > 0: return [(d / gauge) * 100 for d in raw]
+            elif "Time" in x_mode: return times
+            else: return raw
 
-        # Converte Y (invariato)
+        # Converte Y (invariato: sempre basato sul canale motore, indipendente dalla sorgente X)
         if "Stress" in y_mode and area > 0: y_data_final = [(f / area) for f in y_raw_data]
-        elif "Strain" in y_mode and gauge > 0: y_data_final = [(d / gauge) * 100 for d in x_raw_data]
-        elif "Displacement" in y_mode: y_data_final = x_raw_data
+        elif "Strain" in y_mode and gauge > 0: y_data_final = [(d / gauge) * 100 for d in x_raw_motor]
+        elif "Displacement" in y_mode: y_data_final = x_raw_motor
         else: y_data_final = y_raw_data
 
-        # --- MODIFICA (Fix Problema 3) ---
-        # Disegna sulla curva principale (self.plot_curve)
-        if self.plot_curve: # CONTROLLO DI SICUREZZA
-            self.plot_curve.setData(x_data_final, y_data_final)
-        # --- FINE MODIFICA ---
-        
+        # Disegna una curva per ciascuna sorgente X attiva (Motor e/o Encoder)
+        x_data_final = None
+        for source in active_sources:
+            x_data_final = compute_x(source)
+            curve = self.live_curves.get(source)
+            if curve is None:
+                curve = self._create_live_curve(source, active_sources)
+            curve.setData(x_data_final, y_data_final)
+
         # Aggiorna le etichette degli assi (invariato)
         self.plot_widget.setLabel("bottom", x_mode)
         self.plot_widget.setLabel("left", y_mode)
-            
+
         # --- AGGIUNTA PER CURVA RESISTENZA (STREAMING) ---
         if self.resistance_curve: # Controlla se l'asse è attivo
             try:
-                # Estrai i dati di resistenza (indice 7)
+                resistance_source = "motor" if "motor" in active_sources else active_sources[0]
+                x_for_resistance = compute_x(resistance_source)
                 r_raw_data = [p[7] for p in self.current_test_data]
                 r_data_final = [r if r >= 0 else np.nan for r in r_raw_data]
-                self.resistance_curve.setData(x_data_final, r_data_final)
+                self.resistance_curve.setData(x_for_resistance, r_data_final)
             except Exception as e:
                 print(f"Errore aggiornamento curva resistenza live (Cyclic): {e}")
         # --- FINE AGGIUNTA ---
@@ -852,22 +912,38 @@ class CyclicTestWidget(QWidget):
             else:
                 display_text = f"{res_value:.4f}" # Es: 123.4567
         self.resistance_display.set_value(display_text)
+        if self.absolute_encoder_displacement_mm is None:
+            self.encoder_disp_display.set_value("N/A")
+            self.rel_encoder_disp_display.set_value("N/A")
+        else:
+            self.encoder_disp_display.set_value(f"{self.absolute_encoder_displacement_mm:.4f}")
+            relative_encoder_disp = self.absolute_encoder_displacement_mm - self.encoder_displacement_offset_mm
+            self.rel_encoder_disp_display.set_value(f"{relative_encoder_disp:.4f}")
 
 
     def update_ui_for_test_state(self):
         is_running = self.is_test_running
-        self.start_button.setEnabled(not is_running and self.is_homed and len(self.test_sequence) > 0)
-        self.stop_button.setEnabled(is_running)
+        self.start_button.setEnabled(not is_running and not self.is_goto_active and self.is_homed and len(self.test_sequence) > 0)
+        # Abilitato anche durante un Go To: deve poter interrompere entrambi
+        # (vedi on_stop_test()/_cancel_goto())
+        self.stop_button.setEnabled(is_running or self.is_goto_active)
         self.back_button.setEnabled(not is_running)
         # Blocca i controlli della sequenza e gli zeri durante il test
         widgets_to_toggle = [
-            self.up_button, self.down_button, self.jog_speed_spinbox,self.sequence_list, self.add_block_button, self.add_pause_button,
+            self.jog_speed_spinbox, self.goto_button, self.sequence_list, self.add_block_button, self.add_pause_button,
             self.edit_block_button, self.remove_block_button,
             self.zero_rel_load_button, self.zero_rel_disp_button,
             self.limits_button, self.finish_save_button
         ]
         for widget in widgets_to_toggle:
             widget.setEnabled(not is_running)
+
+        # Up/Down/posizione Go To sono disabilitati anche durante un
+        # movimento "Go To" già in corso, non solo durante un test. Il
+        # pulsante Go To stesso resta invece abilitato (a meno di un test in
+        # corso): è lui a diventare "STOP" mentre il movimento è attivo.
+        for widget in (self.up_button, self.down_button, self.goto_position_spinbox):
+            widget.setEnabled(not is_running and not self.is_goto_active)
 
     def set_homing_status(self, is_homed):
         self.is_homed = is_homed
@@ -878,7 +954,10 @@ class CyclicTestWidget(QWidget):
         self.load_offset_N = self.absolute_load_N; self.update_displays()
 
     def zero_relative_displacement(self):
-        self.displacement_offset_mm = self.absolute_displacement_mm; self.update_displays()
+        self.displacement_offset_mm = self.absolute_displacement_mm
+        if self.absolute_encoder_displacement_mm is not None:
+            self.encoder_displacement_offset_mm = self.absolute_encoder_displacement_mm
+        self.update_displays()
 
     def _update_plot_axes(self):
         # Qui aggiorneremo le etichette del grafico quando cambiano i combo box
@@ -1390,6 +1469,41 @@ class CyclicTestWidget(QWidget):
         # Invia il comando solo se il valore è cambiato significativamente (opzionale)
         self.communicator.send_command(f"SET_SPEED:{self.jog_speed_spinbox.value():.2f}")
 
+    # --- GO TO (posizione assoluta) ---
+    def toggle_goto(self):
+        """ Il pulsante stesso funge da STOP mentre il movimento è in corso
+        (stesso pattern di HOMING in manual_control_widget.py). Il pulsante
+        STOP principale (self.stop_button, gestito da on_stop_test) può
+        interrompere lo stesso movimento, vedi _cancel_goto(). """
+        if not self.is_goto_active:
+            target_mm = self.goto_position_spinbox.value()
+            self.set_speed()  # applica la velocità di Jog Speed corrente
+            self.communicator.send_command(f"GOTO:{target_mm:.4f}")
+            self.is_goto_active = True
+            self.goto_button.setText("STOP")
+            self.update_ui_for_test_state()
+        else:
+            self._cancel_goto()
+
+    def _cancel_goto(self):
+        """ Interrompe un movimento "Go To" in corso e ripristina lo stato
+        UI, indipendentemente da quale pulsante l'abbia richiesto (il Go To
+        stesso, o il pulsante STOP principale — vedi on_stop_test()). """
+        self.communicator.send_emergency_stop()
+        self.communicator.send_command("STOP")
+        self.is_goto_active = False
+        self.goto_button.setText("GO TO")
+        self.update_ui_for_test_state()
+
+    def clear_goto_busy_state(self):
+        """ Chiamato da MainWindow quando arriva un messaggio che indica che
+        il motore si è comunque fermato (fine movimento, endstop, limite di
+        sicurezza) senza che l'utente abbia cliccato questo stesso pulsante. """
+        if self.is_goto_active:
+            self.is_goto_active = False
+            self.goto_button.setText("GO TO")
+            self.update_ui_for_test_state()
+
 
     def on_new_specimen(self):
         # Passa la lista dei nomi esistenti per la validazione
@@ -1542,14 +1656,21 @@ class CyclicTestWidget(QWidget):
         plot_item.setLabel("bottom", x_mode)
         plot_item.setLabel("left", y_mode)
 
-        # --- 3. Sotto-funzione convert_data (invariata) ---
-        def convert_data(specimen, raw_data):
+        # --- 3. Sotto-funzione convert_data (estesa con la sorgente X Motor/Encoder) ---
+        def convert_data(specimen, raw_data, source="motor"):
             area = specimen.get("area", 1.0)
             gauge = specimen.get("gauge_length", 1.0)
             if not raw_data: return [], [], []
             try:
                 times = [p[0] for p in raw_data]
-                x_raw = [p[1] for p in raw_data]
+                x_raw_motor = [p[1] for p in raw_data]
+                if source == "encoder":
+                    x_raw = [
+                        (p[8] - self.encoder_displacement_offset_mm) if len(p) > 8 and p[8] is not None else np.nan
+                        for p in raw_data
+                    ]
+                else:
+                    x_raw = x_raw_motor
                 y_raw = [p[2] for p in raw_data]
                 r_raw = [p[7] for p in raw_data]
             except (IndexError, TypeError) as e:
@@ -1558,32 +1679,36 @@ class CyclicTestWidget(QWidget):
             if "Strain" in x_mode and gauge > 0: x = [(d / gauge) * 100 for d in x_raw]
             elif "Time" in x_mode: x = times
             else: x = x_raw
+            # Y resta sempre basata sul canale motore, indipendente dalla sorgente X selezionata
             if "Stress" in y_mode and area > 0: y = [(f / area) for f in y_raw]
-            elif "Strain" in y_mode and gauge > 0: y = [(d / gauge) * 100 for d in x_raw]
-            elif "Displacement" in y_mode: y = x_raw
+            elif "Strain" in y_mode and gauge > 0: y = [(d / gauge) * 100 for d in x_raw_motor]
+            elif "Displacement" in y_mode: y = x_raw_motor
             else: y = y_raw
             r_data = [r if r >= 0 else np.nan for r in r_raw]
             return x, y, r_data
 
-        # --- 4. Logica Overlay (invariata) ---
+        # --- 4. Logica Overlay (una curva per sorgente X attiva) ---
+        active_sources = self._active_x_sources()
         show_overlay = self.overlay_checkbox.isChecked()
         if show_overlay:
             for name, specimen in self.specimens.items():
                 if specimen.get("test_data") and specimen.get("visible", True):
-                    try:
-                        x, y, _ = convert_data(specimen, specimen["test_data"])
-                        curve = self.plot_widget.plot(x, y, pen=self.get_pen_for_specimen(name), name=name)
-                        self.plot_curves[name] = curve
-                    except Exception as e: print(f"Errore disegno overlay {name} (Cyclic): {e}")
+                    for source in active_sources:
+                        try:
+                            x, y, _ = convert_data(specimen, specimen["test_data"], source)
+                            curve = self.plot_widget.plot(x, y, pen=self._pen_for_source(name, source), name=self._curve_label(name, source, active_sources))
+                            self.plot_curves[(name, source)] = curve
+                        except Exception as e: print(f"Errore disegno overlay {name}/{source} (Cyclic): {e}")
         else:
             if self.current_specimen_name:
                 specimen = self.specimens.get(self.current_specimen_name)
                 if specimen and specimen.get("test_data"):
-                    try:
-                        x, y, _ = convert_data(specimen, specimen["test_data"])
-                        curve = self.plot_widget.plot(x, y, pen=self.get_pen_for_specimen(self.current_specimen_name), name=self.current_specimen_name)
-                        self.plot_curves[self.current_specimen_name] = curve
-                    except Exception as e: print(f"Errore disegno non-overlay {self.current_specimen_name} (Cyclic): {e}")
+                    for source in active_sources:
+                        try:
+                            x, y, _ = convert_data(specimen, specimen["test_data"], source)
+                            curve = self.plot_widget.plot(x, y, pen=self._pen_for_source(self.current_specimen_name, source), name=self._curve_label(self.current_specimen_name, source, active_sources))
+                            self.plot_curves[(self.current_specimen_name, source)] = curve
+                        except Exception as e: print(f"Errore disegno non-overlay {self.current_specimen_name}/{source} (Cyclic): {e}")
 
         # --- 5. Logica Secondo Asse Y (Resistenza) (Metodo ManualControl) ---
         lcr_enabled = self.lcr_enable_checkbox.isChecked()
@@ -1633,19 +1758,14 @@ class CyclicTestWidget(QWidget):
                 print(f"Errore creazione asse resistenza (Cyclic - refresh_plot): {e}")
 
         # --- 6. Grafico Live (Fondamentale per Problema 3) ---
-        # QUESTA CURVA DEVE ESSERE CREATA QUI, ALLA FINE,
-        # anche se la funzione è crashata prima, questa è la parte che serve a on_start_test
-        live_name = "Live: " + (self.current_specimen_name if self.current_specimen_name else "N/A")
-        if self.current_specimen_name:
-            final_pen = self.get_pen_for_specimen(self.current_specimen_name)
-            live_pen = pg.mkPen(final_pen); live_pen.setStyle(Qt.PenStyle.DashLine); live_pen.setWidth(2)
-        else:
-            live_pen = pg.mkPen('b', width=2, style=Qt.PenStyle.DashLine)
-        
-        # Questa è la curva live PRINCIPALE (self.plot_curve)
-        self.plot_curve = self.plot_widget.plot([], [], pen=live_pen, name=live_name)
-        
-        # (La sezione "if self.is_test_running..." è rimossa perché 
+        # QUESTE CURVE DEVONO ESSERE CREATE QUI, ALLA FINE,
+        # anche se la funzione è crashata prima, questa è la parte che serve a on_start_test.
+        # Una curva live per sorgente X attiva (Motor e/o Encoder).
+        self.live_curves = {}
+        for source in active_sources:
+            self._create_live_curve(source, active_sources)
+
+        # (La sezione "if self.is_test_running..." è rimossa perché
         # handle_stream_data si occuperà dei dati live)
 
 
@@ -1659,6 +1779,57 @@ class CyclicTestWidget(QWidget):
         colors = ['r', 'b', 'g', 'm', 'c', 'y', 'k']
         index = list(self.specimens.keys()).index(name) % len(colors)
         return pg.mkPen(colors[index], width=2)
+
+    # --- SORGENTE ASSE X (Motor/Encoder) ---
+    def _update_x_source_controls_visibility(self):
+        """ I flag Motor/Encoder hanno senso solo con X = Relative Displacement. """
+        is_disp_mode = (self.x_axis_combo.currentText() == "Relative Displacement (mm)")
+        self.x_source_motor_checkbox.setVisible(is_disp_mode)
+        self.x_source_encoder_checkbox.setVisible(is_disp_mode)
+
+    def _on_x_source_changed(self):
+        # Impedisce di deselezionare entrambe le sorgenti (nessuna curva da disegnare)
+        if not self.x_source_motor_checkbox.isChecked() and not self.x_source_encoder_checkbox.isChecked():
+            sender = self.sender()
+            sender.blockSignals(True)
+            sender.setChecked(True)
+            sender.blockSignals(False)
+        self.refresh_plot()
+
+    def _active_x_sources(self):
+        """ Sorgenti attive per l'asse X: ["motor"], ["encoder"] o entrambe.
+        Fuori dalla modalità Relative Displacement la scelta non si applica: sempre motore. """
+        if self.x_axis_combo.currentText() != "Relative Displacement (mm)":
+            return ["motor"]
+        sources = []
+        if self.x_source_motor_checkbox.isChecked(): sources.append("motor")
+        if self.x_source_encoder_checkbox.isChecked(): sources.append("encoder")
+        return sources or ["motor"]
+
+    def _pen_for_source(self, name, source):
+        colors = ['r', 'b', 'g', 'm', 'c', 'y', 'k']
+        index = list(self.specimens.keys()).index(name) % len(colors) if name in self.specimens else 0
+        style = Qt.PenStyle.DashLine if source == "encoder" else Qt.PenStyle.SolidLine
+        return pg.mkPen(colors[index], width=2, style=style)
+
+    def _curve_label(self, name, source, active_sources):
+        if len(active_sources) > 1:
+            return f"{name} ({'Encoder' if source == 'encoder' else 'Motor'})"
+        return name
+
+    def _create_live_curve(self, source, active_sources):
+        if self.current_specimen_name:
+            final_pen = self.get_pen_for_specimen(self.current_specimen_name)
+            live_pen = pg.mkPen(final_pen); live_pen.setWidth(2)
+        else:
+            live_pen = pg.mkPen('b', width=2)
+        live_pen.setStyle(Qt.PenStyle.DotLine if source == "encoder" else Qt.PenStyle.DashLine)
+        live_name = "Live: " + (self.current_specimen_name if self.current_specimen_name else "N/A")
+        if len(active_sources) > 1:
+            live_name += " (Encoder)" if source == "encoder" else " (Motor)"
+        curve = self.plot_widget.plot([], [], pen=live_pen, name=live_name)
+        self.live_curves[source] = curve
+        return curve
 
 
     def convert_speed(self, value, unit, gauge_length):

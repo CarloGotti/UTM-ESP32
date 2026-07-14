@@ -30,7 +30,17 @@ Sono due repository git separati e indipendenti.
     nulla della sequenza intera: la logica multi-blocco vive tutta qui. Gestisce anche
     `STATUS:CALIBRATION_INVALIDATED` (emesso dal firmware quando un cambio di guadagno
     PGA reale invalida offset/scala correnti): resetta lo stato di calibrazione
-    mostrato in GUI e avvisa l'utente che deve ripetere Tara e Calibrazione.
+    mostrato in GUI e avvisa l'utente che deve ripetere Tara e Calibrazione. Estrae
+    anche il 6° campo (opzionale) del pacchetto `D:`, il conteggio grezzo
+    dell'encoder incrementale esterno, e lo converte in `encoder_displacement_mm`
+    (canale di sola lettura, non usato per nessuna decisione real-time — vedi
+    `CHANGELOG.md`). Estrae anche `STATUS:CALIBRATION_DONE;SCALE=..` per
+    `calibration_widget.set_calibration_factor()`. Dopo l'intera catena
+    `if/elif` dei messaggi `STATUS:`, un controllo aggiuntivo non esclusivo
+    chiama `clear_goto_busy_state()` su `monotonic_test_widget`/`cyclic_test`
+    per qualunque messaggio che indichi che il motore si è comunque fermato
+    (`MOVE_COMPLETED`, `STOPPED_BY_USER`, `TOP_HIT`, `BOTTOM_HIT`,
+    `LIMIT_HIT`), per chiudere lo stato "Go To in corso" su quei widget.
   - Timer a 100 ms che invia `GET_DATA` in polling (usato solo quando non si è in
     streaming, cioè fuori da un test).
   - `current_force_limit_N` / `current_disp_limit_mm`: stato lato GUI dei limiti di
@@ -56,23 +66,41 @@ Sono due repository git separati e indipendenti.
   UP/DOWN a pressione, che inviano `JOG_UP`/`JOG_DOWN` su `pressed` e `STOP` su
   `released`), homing, zero relativi, grafico live (carico vs tempo, finestra
   scorrevole), registrazione manuale dei dati su Excel, toggle lettura LCR.
+  Mostra anche lo spostamento dell'encoder incrementale esterno, sia assoluto
+  sia relativo (`Relative Enc. Displacement (mm)`, azzerato insieme allo
+  spostamento a passi motore dallo stesso pulsante "Zero Relative
+  Displacement" — vedi `CHANGELOG.md`).
 
 - **`calibration_widget.py`** — `CalibrationWidget`: wizard a stati
   (`IDLE → WAITING_FOR_ZERO → WAITING_FOR_WEIGHT → IDLE`) che pilota `TARE` e
   `CALIBRATE:<grammi>` sul firmware. Gestisce anche salvataggio/caricamento di un
-  fattore di calibrazione su file JSON esterno (diverso da `settings.json`).
+  fattore di calibrazione su file JSON esterno (diverso da `settings.json`):
+  traccia `current_calibration_factor`, popolato da
+  `STATUS:CALIBRATION_DONE;SCALE=..` (inoltrato da `MainWindow`) o direttamente
+  dopo un caricamento da file, e azzerato da `invalidate_calibration()` su
+  `STATUS:CALIBRATION_INVALIDATED` — necessario perché "Save Calibration"
+  abbia davvero qualcosa da scrivere (era rotto, vedi punto critico 2).
 
 - **`monotonic_test_widget.py`** — `MonotonicTestWidget`: gestione di un batch di
   "provini" (specimen) con parametri (gauge length, area, velocità, criterio di
   stop), avvio di un singolo test monotonico (`START_TEST:...`), grafico
   carico/spostamento con conversione opzionale in stress/strain, overlay di test
-  precedenti, autosave in Excel a fine test.
+  precedenti, autosave in Excel a fine test. Mostra anche lo spostamento
+  dell'encoder esterno (assoluto e relativo) e permette di scegliere, quando
+  l'asse X è "Relative Displacement (mm)", se usare come sorgente il canale
+  motore e/o quello encoder (overlay di due curve in tempo reale — vedi
+  `CHANGELOG.md`). Ha un controllo "Go To" (posizione assoluta, mm >= 0, alla
+  velocità di Jog Speed) accanto a Up/Down: il pulsante Go To stesso diventa
+  "STOP" durante il movimento, e anche il pulsante STOP principale della
+  schermata può interromperlo.
 
 - **`cyclic_test_widget.py`** (file più grande, ~1800 righe) — `CyclicTestWidget`:
   editor di una **sequenza di blocchi** (blocco ciclico, pausa, rampa — dialog
   dedicati `BlockDialog`/`PauseDialog`/`RampDialog`), gestione batch provini simile
   al monotonico. Avvia solo il **primo** blocco della sequenza; i blocchi successivi
   sono pilotati da `main.py` in risposta a `STATUS:BLOCK_COMPLETED` (vedi sopra).
+  Stesse aggiunte encoder/"Go To"/selezione sorgente X di
+  `monotonic_test_widget.py` (vedi sopra e `CHANGELOG.md`).
 
 - **`data_saver.py`** — `DataSaver`: esporta i dati di test (monotonici o ciclici) in
   `.xlsx` con `openpyxl`, un foglio per provino, grafici Scatter incorporati
@@ -158,6 +186,7 @@ d'emergenza, `send_emergency_stop()` (bypass coda).
 | `JOG_UP` / `JOG_DOWN` | — | Solo se `motor_state == STOPPED` e non jog hardware attivo |
 | `HOME` | — | Avvia sequenza di homing a stati (fast→backoff→slow→final lift) |
 | `SET_SPEED:<mm/s>` | — | Stessa condizione di JOG_* |
+| `GOTO:<mm>` | mm assoluti, >= 0 | Movimento verso una posizione assoluta, alla velocità impostata con `SET_SPEED`. Stessa condizione di JOG_* (`motor_state == STOPPED`, non jog hardware attivo). Usa lo stesso meccanismo a passi contati di `RETURN_TO_START` (nessun nuovo `MotorState`): risponde `STATUS:GOTO_STARTED` o, se già alla posizione target, `STATUS:MOVE_COMPLETED` subito. `STOP`/`!` lo interrompono sempre, azzerando esplicitamente `target_steps_remaining` |
 | `ENABLE_LCR_POLLING` / `DISABLE_LCR_POLLING` | — | Attiva/disattiva interrogazione LCR-meter su Serial2 |
 
 Tutti i comandi con parametri usano il formato `CHIAVE=valore;CHIAVE=valore` fatto a
@@ -169,14 +198,32 @@ verso il firmware converte sempre in **grammi** (`(N/9.81)*1000`) e **mm assolut
 (`PULSES_TO_MM`) e lavora internamente in grammi per la forza. `PULSES_PER_REV=2000`,
 `GEAR_RATIO=10`, `SCREW_PITCH_MM=5.0873` sono **duplicati indipendentemente** sia in
 `main.py` (`MainWindow.__init__`) sia in `main.cpp`: oggi coincidono, ma non c'è
-alcun meccanismo che li tenga sincronizzati se uno dei due cambia.
+alcun meccanismo che li tenga sincronizzati se uno dei due cambia. La conversione
+dell'encoder esterno (`encoder_count / 4800.0 * SCREW_PITCH_MM`) riusa la stessa
+costante `SCREW_PITCH_MM` già presente in `main.py`, senza bisogno di
+`GEAR_RATIO` (l'encoder è montato direttamente sulla vite, non sull'albero motore).
 
 ### Messaggi ESP32 → PC
 
-- **`D:<load_g>;<pulse_count>;<elapsed_ms>;<cycle>;<resistance_ohm>`** — pacchetto
-  dati, sempre a **5 campi**, sia in risposta a `GET_DATA` (con `time`/`cycle`
-  fittizi a `"0"`) sia in streaming. `main.py` sa ancora parsare varianti storiche a
-  3 o 4 campi (retrocompatibilità morta: il firmware attuale non le invia più).
+- **`D:<load_g>;<pulse_count>;<elapsed_ms>;<cycle>;<resistance_ohm>;<encoder_count>`**
+  — pacchetto dati, sempre a **6 campi**, sia in risposta a `GET_DATA` (con
+  `time`/`cycle` fittizi a `"0"`) sia in streaming. `main.py` sa ancora parsare
+  varianti storiche a 3, 4 o 5 campi (retrocompatibilità morta: il firmware
+  attuale non le invia più). Il 6° campo (`encoder_count`) è il conteggio
+  grezzo dell'encoder incrementale esterno Omron E6B2-CWZ6C (quadratura 4x,
+  1200 PPR → 4800 conteggi/giro), montato direttamente sulla vite senza fine
+  (nessun `GEAR_RATIO` di mezzo). **È un canale di misura aggiuntivo, di sola
+  lettura (Livello 1)**: non influenza in alcun modo il comando motore né i
+  limiti di sicurezza assoluti, che restano basati su `pulse_count` come
+  prima. Conversione lato Python: `mm = (encoder_count / 4800.0) *
+  SCREW_PITCH_MM`. Convenzione di segno verificata su hardware: quando la
+  traversa sale, sia `pulse_count` sia `encoder_count` aumentano (stesso
+  segno, nessuna inversione da compensare). La sequenza di **homing**
+  esistente è anche il punto di zero comune per entrambi i canali: allo
+  stesso punto in cui azzera `pulse_count` (fine `HOMING_FINAL_LIFT`), il
+  firmware azzera ora anche il contatore encoder — nessun comando o
+  homing separato per l'encoder. Vedi `CHANGELOG.md` per i
+  compromessi emersi durante l'integrazione.
 - **`STATUS:<messaggio>`** — testo libero, interpretato in `main.py` per substring
   matching (es. `"TOP_HIT" in status_message`), non per uguaglianza esatta. Esempi:
   `TEST_STARTED`, `TEST_COMPLETED`, `TEST_STOPPED_BY_USER`, `CYCLIC_TEST_STARTED`,
@@ -185,7 +232,9 @@ alcun meccanismo che li tenga sincronizzati se uno dei due cambia.
   `LIMIT_HIT_DISPLACEMENT`, `LIMIT_HIT_FORCE`, `HOMING_BACKOFF`, `HOMING_SLOW`,
   `HOMING_LIFTING`, `HOMING_COMPLETED`, `HOMED`, `TARE_DONE;OFFSET=..`,
   `CALIBRATION_DONE;SCALE=..`, `LIMITS_SET;MAX_FORCE_G=..;MAX_PULSES=..`,
-  `MOVE_COMPLETED`, `RETURN_COMPLETED`, `RETURNING`, `MODE_SET`, `TIMER_RESET`,
+  `MOVE_COMPLETED`, `RETURN_COMPLETED`, `RETURNING`, `GOTO_STARTED` (risposta a
+  `GOTO:<mm>`; se già alla posizione target arriva `MOVE_COMPLETED` invece),
+  `MODE_SET`, `TIMER_RESET`,
   `SCALE_SET`, `LCR_POLLING_ENABLED`/`DISABLED`, `STOPPED_BY_USER`,
   `FILTER_CONFIG_SET;ALPHA=..;RATE=..;GAIN=..`, `FILTER_CONFIG_REJECTED;REASON=..`,
   `FILTER_CONFIG;ALPHA=..;RATE=..;GAIN=..` (risposta a `GET_FILTER_CONFIG`),
@@ -211,13 +260,21 @@ alcun meccanismo che li tenga sincronizzati se uno dei due cambia.
    `self.main_window.current_force_limit_N`; verificato su hardware reale (vedi
    `CHANGELOG.md`).
 
-2. **Il pulsante "Save Calibration" non salva nulla.**
-   `CalibrationWidget.save_calibration()` ([calibration_widget.py:157-164](calibration_widget.py#L157-L164))
-   apre un file dialog e poi fa solo `self.save_calibration_requested.emit(filePath)`.
-   Quel segnale è definito ma **non è collegato a nessuno slot** in `main.py` (sono
-   collegati solo `calibration_updated` e `settings_changed`). Risultato: l'utente
-   sceglie un percorso, vede l'interazione completarsi, ma nessun file JSON viene
-   scritto — probabilmente una feature rimasta a metà durante un refactor.
+2. ✅ **[RISOLTO 2026-07-14]** Il pulsante "Save Calibration" non salvava
+   nulla. `CalibrationWidget.save_calibration()` apriva un file dialog e poi
+   si limitava a `self.save_calibration_requested.emit(filePath)`, un
+   segnale mai collegato a nessuno slot in `main.py`: l'utente sceglieva un
+   percorso, vedeva l'interazione completarsi, ma nessun file JSON veniva
+   scritto — e il widget non aveva comunque modo di sapere quale fosse il
+   fattore di scala corrente da salvare (nessun comando/risposta lo
+   comunicava mai alla GUI). Risolto tracciando `current_calibration_factor`
+   sul widget, popolato da `STATUS:CALIBRATION_DONE;SCALE=..` (inoltrato da
+   `MainWindow`) dopo una calibrazione, o direttamente dopo un
+   `load_calibration()` da file; `save_calibration()` ora scrive il JSON
+   direttamente (rimossa l'indirezione morta verso `MainWindow`), ed è
+   disabilitato se non c'è ancora un fattore noto. Il segnale
+   `save_calibration_requested` è stato rimosso. Vedi `CHANGELOG.md` e
+   `docs/calibration_widget.md`.
 
 3. ✅ **[RISOLTO 2026-07-02]** I limiti di sicurezza assoluti del firmware non
    erano mai sincronizzati automaticamente. `absolute_max_force_grams`/
@@ -299,15 +356,30 @@ alcun meccanismo che li tenga sincronizzati se uno dei due cambia.
    silenziosamente scorretto (troncato), potenzialmente sotto-stimando il carico
    reale proprio vicino al limite di sicurezza. Rischio noto, non mitigato.
 
+10. ✅ **[RISOLTO 2026-07-14]** Il pulsante STOP principale di
+    `MonotonicTestWidget`/`CyclicTestWidget` non riusciva a interrompere un
+    movimento "Go To" (segnalato dall'utente: "sembra disattivato"). La sua
+    abilitazione in `update_ui_for_test_state()` dipendeva solo da
+    `is_test_running`, che un Go To non imposta mai di proposito (non è un
+    test); anche abilitandolo, `on_stop_test()` usciva comunque subito per
+    lo stesso motivo. L'unico modo per fermare un Go To era ricliccare il
+    pulsante Go To stesso (diventato "STOP" durante il movimento by design)
+    — funzionalmente corretto ma sorprendente, con un pulsante STOP grande
+    e rosso già in vista che sembrava non fare nulla. Risolto abilitando
+    `stop_button` anche con `is_goto_active`, e facendo controllare a
+    `on_stop_test()` prima questo stato (chiamando la nuova `_cancel_goto()`
+    condivisa) prima di valutare se c'è anche un test da fermare. Vedi
+    `CHANGELOG.md` e `docs/monotonic_test_widget.md`/`docs/cyclic_test_widget.md`.
+
 ## Inconsistenze note tra Python e firmware (riepilogo)
 
 | Aspetto | Python si aspetta | Firmware fa | Stato |
 |---|---|---|---|
 | Baud rate | 460800 | 460800 | ✅ coerente (ma duplicato, nessuna negoziazione) |
-| Formato `D:` | fino a 5 campi, tollera 3/4 (storico) | sempre 5 campi | ✅ ma retrocompatibilità Python inutile |
+| Formato `D:` | fino a 6 campi, tollera 3/4/5 (storico) | sempre 6 campi | ✅ ma retrocompatibilità Python inutile |
 | Limiti sicurezza | GUI mostra 10N/190mm come "attivi" di default | Firmware disabilitato di default, ora ricevuto automaticamente alla connessione (con ritardo di boot) e dopo calibrazione | ✅ **risolto**, vedi punto 3 |
 | Force stop criterion (monotonico) | invia `START_TEST` dopo un controllo di sicurezza sul limite | il controllo funziona correttamente, nessun crash | ✅ **risolto**, vedi punto 1 |
-| Salvataggio calibrazione su file | utente si aspetta che "Save Calibration" scriva un file | segnale emesso ma non collegato | ⚠️ **funzione silenziosamente rotta**, vedi punto 2 |
+| Salvataggio calibrazione su file | utente si aspetta che "Save Calibration" scriva un file | scrive un JSON con il fattore di scala noto, disabilitato se non ancora noto | ✅ **risolto**, vedi punto 2 |
 | `GET_SCALE` | mai chiamato | implementato e funzionante | codice morto lato protocollo |
 | Costanti meccaniche (`PULSES_PER_REV`, `GEAR_RATIO`, `SCREW_PITCH_MM`) | copia locale in `main.py` | copia locale in `main.cpp` | coerenti oggi, nessun single source of truth |
 | Filtro cella di carico | si aspetta filtro EMA configurabile (alpha/rate/gain), non contatori anti-spike | EMA centralizzato, sostituisce i tre vecchi contatori anti-spike HX711 | ✅ **migrato**, vedi `CHANGELOG.md` (migrazione NAU7802) |

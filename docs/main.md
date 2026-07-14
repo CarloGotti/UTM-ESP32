@@ -13,7 +13,9 @@ dall'ESP32.
 
 - **`MainWindow(QMainWindow)`** — finestra principale, unica classe del file.
   - `__init__()`: crea `SettingsManager`, costanti meccaniche
-    (`PULSES_PER_REV`, `GEAR_RATIO`, `SCREW_PITCH_MM`, `PULSES_TO_MM`), i
+    (`PULSES_PER_REV`, `GEAR_RATIO`, `SCREW_PITCH_MM`, `PULSES_TO_MM`,
+    `ENCODER_COUNTS_PER_REV` = 4800.0 per l'encoder esterno, che riusa
+    `SCREW_PITCH_MM` senza bisogno di `GEAR_RATIO`), i
     limiti di sicurezza lato GUI (`current_force_limit_N` = 10 N di default,
     `current_disp_limit_mm` = 190 mm), la configurazione del filtro cella di
     carico (`current_filter_alpha` / `current_filter_rate_sps` /
@@ -42,19 +44,44 @@ dall'ESP32.
       `EXECUTE_RAMP`). Se non ci sono altri blocchi, invia
       `SET_MODE:POLLING` e chiude il test. Gestisce anche fine test
       monotonico/ciclico, colpi di endstop, `LIMIT_HIT` (via segnale
-      thread-safe `limit_hit_signal`), homing.
-    - Per `D:`: fa parsing flessibile a 3/4/5 campi (solo 5 usato dal firmware
-      attuale), converte grammi→N e passi→mm, aggiorna le variabili assolute
-      (`absolute_load_N`, `absolute_displacement_mm`, `current_resistance_ohm`)
-      su tutti i widget che le espongono, poi chiama `handle_stream_data()` e
-      `update_displays()` sul widget attualmente visibile.
+      thread-safe `limit_hit_signal`), homing. Dopo l'intera catena
+      `if/elif`, un controllo aggiuntivo **non esclusivo** (un `if`
+      indipendente, non un altro `elif`) chiama
+      `clear_goto_busy_state()` su `monotonic_test_widget` e `cyclic_test`
+      per qualunque messaggio che contenga `MOVE_COMPLETED`,
+      `STOPPED_BY_USER`, `TOP_HIT`, `BOTTOM_HIT` o `LIMIT_HIT`: serve a
+      chiudere lo stato "Go To in corso" su quei widget quando il motore si
+      ferma per una ragione diversa dal click dell'utente sullo stesso
+      pulsante Go To (che si ripristina già da solo, otticamente, appena
+      cliccato — vedi `docs/monotonic_test_widget.md`).
+    - Per `D:`: fa parsing flessibile a 3/4/5/6 campi (solo 6 usato dal
+      firmware attuale), converte grammi→N e passi→mm, aggiorna le variabili
+      assolute (`absolute_load_N`, `absolute_displacement_mm`,
+      `current_resistance_ohm`) su tutti i widget che le espongono, poi
+      chiama `handle_stream_data()` e `update_displays()` sul widget
+      attualmente visibile. Il 6° campo (opzionale, `None` se assente o non
+      parsabile) è il conteggio grezzo dell'encoder incrementale esterno:
+      viene convertito in `encoder_displacement_mm` con
+      `(encoder_count / ENCODER_COUNTS_PER_REV) * SCREW_PITCH_MM` e
+      propagato come `absolute_encoder_displacement_mm` sui widget, e passato
+      come argomento aggiuntivo a `handle_stream_data()`. **Canale di sola
+      lettura (Livello 1)**: non entra in nessuna validazione di sicurezza né
+      logica di stop, serve solo per confronto/logging (vedi `CHANGELOG.md`).
     - `"CALIBRATION_INVALIDATED" in status_message`: resetta
       `active_calibration_info` a "Not Calibrated" (propagato a
-      `manual_control`/`monotonic_test_widget`) e mostra un popup di avviso.
-      Emesso dal firmware quando un `SET_FILTER_CONFIG` cambia realmente il
-      guadagno PGA — copre sia il cambio esplicito dal dialog "Filter Config"
-      sia il reinvio automatico alla riconnessione, se il gain salvato in
-      `settings.json` differisce da quello con cui il firmware è ripartito.
+      `manual_control`/`monotonic_test_widget`), chiama
+      `calibration_widget.invalidate_calibration()` (azzera il fattore di
+      scala noto lì, vedi `docs/calibration_widget.md`) e mostra un popup di
+      avviso. Emesso dal firmware quando un `SET_FILTER_CONFIG` cambia
+      realmente il guadagno PGA — copre sia il cambio esplicito dal dialog
+      "Filter Config" sia il reinvio automatico alla riconnessione, se il
+      gain salvato in `settings.json` differisce da quello con cui il
+      firmware è ripartito.
+    - `"CALIBRATION_DONE" in status_message`: estrae `SCALE=<valore>` e lo
+      passa a `calibration_widget.set_calibration_factor()` — è il solo modo
+      in cui la GUI viene a conoscenza del fattore di scala reale calcolato
+      dal firmware dopo `CALIBRATE:<grammi>`, necessario perché "Save
+      Calibration" abbia qualcosa da scrivere (vedi `CHANGELOG.md`).
   - `update_calibration_status(status_text, cell_name)`: propaga lo stato di
     calibrazione ai widget e, se `cell_name` è parsabile come "<numero>N",
     aggiorna `current_force_limit_N` e chiama `send_limits_to_firmware()`.
