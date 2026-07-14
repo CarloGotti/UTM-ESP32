@@ -6,6 +6,7 @@
 const int PUL_PIN = 2, DIR_PIN = 4, UP_BUTTON_PIN = 18, DOWN_BUTTON_PIN = 19;
 const int TOP_ENDSTOP_PIN = 22, BOTTOM_ENDSTOP_PIN = 23;
 const int LOADCELL_SDA_PIN = 32, LOADCELL_SCL_PIN = 33;
+const int ENCODER_PIN_A = 34, ENCODER_PIN_B = 35, ENCODER_PIN_Z = 27;
 
 
 
@@ -64,6 +65,58 @@ if (target_steps_remaining > 0) {
 }
 } 
 
+
+// --- ENCODER INCREMENTALE ESTERNO (Omron E6B2-CWZ6C, 1200 PPR) ---
+// Canale di misura indipendente, montato direttamente sulla vite senza fine
+// (nessun GEAR_RATIO di mezzo). Livello 1: sola lettura, non influenza in
+// alcun modo il comando motore né i limiti di sicurezza assoluti, che restano
+// basati su pulse_count. Decodifica in quadratura 4x (interrupt su A e B) +
+// conteggio giri su Z, portata qui invariata dal modulo di validazione
+// standalone testato su hardware reale (4800 conteggi/giro confermati).
+volatile long encoder_position = 0;
+volatile unsigned long encoder_z_turns = 0;
+volatile uint8_t encoder_last_state = 0;
+volatile int encoder_last_z_state = HIGH;
+portMUX_TYPE encoder_mux = portMUX_INITIALIZER_UNLOCKED;
+
+// Tabella di decodifica quadratura: indice = (stato_vecchio<<2)|stato_nuovo,
+// ciascuno stato codificato come (A<<1)|B. 0 = transizione non valida
+// (entrambi i canali cambiati nello stesso istante: rumore o passo perso).
+static const int8_t ENCODER_QUAD_TABLE[16] = {
+   0,  +1, -1,  0,
+  -1,   0,  0, +1,
+  +1,   0,  0, -1,
+   0,  -1, +1,  0
+};
+
+void IRAM_ATTR handleEncoderChange() {
+  uint8_t newState = (digitalRead(ENCODER_PIN_A) << 1) | digitalRead(ENCODER_PIN_B);
+  uint8_t index = (encoder_last_state << 2) | newState;
+  int8_t delta = ENCODER_QUAD_TABLE[index];
+
+  portENTER_CRITICAL_ISR(&encoder_mux);
+  encoder_position += delta;
+  portEXIT_CRITICAL_ISR(&encoder_mux);
+
+  encoder_last_state = newState;
+}
+
+void IRAM_ATTR handleEncoderZChange() {
+  int z = digitalRead(ENCODER_PIN_Z);
+  // Solo fronte di discesa (transistor open collector che conduce = impulso indice attivo).
+  if (z == LOW && encoder_last_z_state == HIGH) {
+    encoder_z_turns++;
+  }
+  encoder_last_z_state = z;
+}
+
+long readEncoderPosition() {
+  long value;
+  portENTER_CRITICAL(&encoder_mux);
+  value = encoder_position;
+  portEXIT_CRITICAL(&encoder_mux);
+  return value;
+}
 
 // Cache lettura carico (in grammi)
 volatile float last_load_grams = 0.0f;
@@ -147,6 +200,16 @@ void setup()
   pinMode(UP_BUTTON_PIN, INPUT_PULLUP);
   pinMode(DOWN_BUTTON_PIN, INPUT_PULLUP);
 
+  pinMode(ENCODER_PIN_A, INPUT);
+  pinMode(ENCODER_PIN_B, INPUT);
+  pinMode(ENCODER_PIN_Z, INPUT);
+  // Stato iniziale, per non generare un delta spurio alla prima transizione.
+  encoder_last_state = (digitalRead(ENCODER_PIN_A) << 1) | digitalRead(ENCODER_PIN_B);
+  encoder_last_z_state = digitalRead(ENCODER_PIN_Z);
+  attachInterrupt(digitalPinToInterrupt(ENCODER_PIN_A), handleEncoderChange, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(ENCODER_PIN_B), handleEncoderChange, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(ENCODER_PIN_Z), handleEncoderZChange, CHANGE);
+
   Wire.begin(LOADCELL_SDA_PIN, LOADCELL_SCL_PIN);
   scale.begin(Wire);
   scale.setGain(NAU7802_GAIN_128); // Esplicito per chiarezza (coincide col default interno di begin())
@@ -201,6 +264,7 @@ void handleSerialCommands()
       motor_state = STOPPED;
       comms_mode = POLLING;
       stopMotor();  // ferma subito i passi
+      target_steps_remaining = 0;  // azzera un eventuale movimento a passi contati in corso (es. GOTO)
       if (was_monotonic) {
           Serial.println("STATUS:TEST_STOPPED_BY_USER");
       } else if (was_cyclic) {
@@ -258,6 +322,7 @@ void processCommand(const String &command)
     bool was_test = was_monotonic || was_cyclic;
     motor_state = STOPPED;
     stopMotor();  // ferma subito i passi
+    target_steps_remaining = 0;  // azzera un eventuale movimento a passi contati in corso (es. GOTO)
     if (was_test) comms_mode = POLLING;
     if (was_monotonic) {
         Serial.println("STATUS:TEST_STOPPED_BY_USER");
@@ -293,7 +358,9 @@ void processCommand(const String &command)
     Serial.print(";");
     Serial.print("0");                // 4. Cycle - Fittizio
     Serial.print(";");
-    Serial.println(last_lcr_resistance, 4); // 5. Resistance
+    Serial.print(last_lcr_resistance, 4); // 5. Resistance
+    Serial.print(";");
+    Serial.println(readEncoderPosition()); // 6. Encoder count (grezzo, sola lettura)
   }
   else if (command == "TARE")
   {
@@ -686,6 +753,28 @@ void processCommand(const String &command)
         setMotorSpeed(speed_mms);
       }
     }
+    else if (command.startsWith("GOTO:"))
+    {
+      // Movimento verso una posizione assoluta (mm, sola andata, >= 0 come
+      // da richiesta esplicita). Stesso meccanismo a passi contati già
+      // usato da RETURN_TO_START: non introduce un nuovo MotorState, resta
+      // STOPPED per tutta la durata del movimento (STOP/'!' lo interrompono
+      // sempre azzerando target_steps_remaining, vedi sopra).
+      float target_mm = command.substring(5).toFloat();
+      if (target_mm >= 0) {
+        long target_steps = (long)(target_mm / PULSES_TO_MM);
+        long delta = target_steps - pulse_count;
+        if (delta == 0) {
+          Serial.println("STATUS:MOVE_COMPLETED");
+        } else {
+          dir_up = (delta > 0);
+          digitalWrite(DIR_PIN, dir_up ? HIGH : LOW);
+          target_steps_remaining = labs(delta);
+          motor_enabled = true;
+          Serial.println("STATUS:GOTO_STARTED");
+        }
+      }
+    }
   }
 }
 
@@ -924,7 +1013,15 @@ void updateMotorState()
         stopMotor(); // Assicura che il motore sia fermo
 
         // ORA azzera la posizione
-        pulse_count = 0; 
+        pulse_count = 0;
+
+        // L'homing esistente diventa anche il punto di zero per il canale
+        // encoder esterno (Livello 1): stessa sezione critica già usata da
+        // readEncoderPosition() per l'accesso sicuro dal loop() alle ISR.
+        portENTER_CRITICAL(&encoder_mux);
+        encoder_position = 0;
+        encoder_z_turns = 0;
+        portEXIT_CRITICAL(&encoder_mux);
 
         // Finalizza lo stato di homing
         motor_state = STOPPED;
@@ -1201,7 +1298,9 @@ void handleDataStreaming() {
       Serial.print(";");
       Serial.print(cyclic_current_cycle);
       Serial.print(";");
-      Serial.println(last_lcr_resistance, 4);
+      Serial.print(last_lcr_resistance, 4);
+      Serial.print(";");
+      Serial.println(readEncoderPosition());
     }
   }
 }
