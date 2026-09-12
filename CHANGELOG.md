@@ -4,6 +4,21 @@ Riepilogo concettuale dei cambiamenti architetturali e delle correzioni
 rilevanti al progetto. Non è un log riga-per-riga dei commit: per quello si
 veda la cronologia git. Ogni voce spiega **cosa** è cambiato e **perché**.
 
+## 2026-09-10
+
+### Fix: peso di calibrazione errato per la cella 200N (1398g → 4990g)
+
+Il carico di calibrazione registrato per la cella "200N" in `cal_loads`
+(`settings.json` e default in `settings_manager.py`) era 1398 g — lo stesso
+valore usato per la cella "100N" — invece del peso noto realmente usato per
+la cella da 200N (4990 g). Chiunque calibrasse la cella da 200N usando il
+peso indicato dalla GUI otteneva un fattore di scala sistematicamente
+errato (~72% di scarto rispetto al peso reale applicato), lo stesso tipo di
+problema già riscontrato e corretto per la cella 50N (vedi voce
+2026-07-02). Corretto il valore in entrambi i punti in cui è definito;
+salvato anche un nuovo fattore di calibrazione (`cal_200N_2026-09-10.json`)
+ottenuto ripetendo Tara e Calibrazione con il peso corretto.
+
 ## 2026-07-21
 
 ### Feature: ADS1220 (ADC SPI) integrato per la misura di resistenza dei campioni, canale alternativo all'LCR-meter
