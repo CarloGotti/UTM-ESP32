@@ -1,5 +1,6 @@
 #include <Arduino.h>
 #include <Wire.h>
+#include <SPI.h>
 #include "SparkFun_Qwiic_Scale_NAU7802_Arduino_Library.h"
 
 // --- CONFIGURAZIONE PIN E PARAMETRI ---
@@ -7,6 +8,10 @@ const int PUL_PIN = 2, DIR_PIN = 4, UP_BUTTON_PIN = 18, DOWN_BUTTON_PIN = 19;
 const int TOP_ENDSTOP_PIN = 22, BOTTOM_ENDSTOP_PIN = 23;
 const int LOADCELL_SDA_PIN = 32, LOADCELL_SCL_PIN = 33;
 const int ENCODER_PIN_A = 34, ENCODER_PIN_B = 35, ENCODER_PIN_Z = 27;
+const int KILLSWITCH_SENSE_PIN = 39; // "VN", input-only, pull-up esterno 10k verso 3.3V
+// Jog encoder (controllo manuale fisico, NON l'encoder esterno di misura sopra):
+// encoder meccanico "nudo" 5 pin con pulsante integrato per il preset di step.
+const int JOG_ENCODER_A = 13, JOG_ENCODER_B = 14, JOG_ENCODER_SW = 25;
 
 
 
@@ -39,12 +44,34 @@ const float default_return_speed_mms = 10.0;  // velocità di ritorno al punto i
 long pulse_delay_micros = 500; // periodo passi
 hw_timer_t * stepTimer = NULL;
 
-enum MotorState { STOPPED, JOG_UP, JOG_DOWN, HOMING, MONOTONIC_TEST, CYCLIC_TEST }; 
+enum MotorState { STOPPED, JOG_UP, JOG_DOWN, HOMING, MONOTONIC_TEST, CYCLIC_TEST };
 MotorState motor_state = STOPPED;
 MotorState previous_motor_state = STOPPED;
 bool is_hardware_jog_active = false;
 enum HomingPhase { HOMING_FAST, HOMING_BACKOFF, HOMING_SLOW, HOMING_FINAL_LIFT };
 HomingPhase homing_phase;
+
+// --- KILLSWITCH HARDWARE (GPIO39, "VN") ---
+// Topologia e verifica fisica: vedi CLAUDE.md. GPIO39=LOW -> riposo (48V
+// presenti). GPIO39=HIGH -> killswitch premuto (48V realmente tagliati).
+// Debounce asimmetrico voluto: la pressione (transizione a HIGH) viene
+// rilevata subito, senza alcun ritardo; il rilascio (transizione a LOW)
+// richiede ~200ms di stato stabile prima di essere considerato reale, per non
+// scambiare un rimbalzo meccanico in rilascio per un vero rilascio.
+volatile bool killswitch_raw_high = false;
+volatile unsigned long killswitch_last_high_ms = 0;
+bool killswitch_engaged = false; // stato effettivo (debounced), letto/scritto solo in loop()/ISR-safe via i due volatile sopra
+const unsigned long KILLSWITCH_RELEASE_DEBOUNCE_MS = 200;
+
+// True finché non viene completato con successo un HOME successivo a un
+// trigger del killswitch (o già true dal boot se il killswitch era premuto
+// all'accensione). Blocca l'avvio di prove e GOTO; non blocca mai HOME, che
+// resta l'unico modo per uscire da questo stato. In futuro, quando verranno
+// aggiunti jog fisici (pulsanti/encoder), la stessa variabile killswitch_engaged
+// andrà usata per permetterli in stato "giallo" (unverified ma non premuto) e
+// bloccarli solo in stato "rosso" (premuto) — stessa regola già applicata qui
+// sotto a JOG_UP/JOG_DOWN via comando seriale.
+bool position_unverified = false;
 
 // --- ISR TIMER ---
  void IRAM_ATTR onStepTimer() {
@@ -63,7 +90,21 @@ if (target_steps_remaining > 0) {
   }
 }
 }
-} 
+}
+
+
+// --- ISR KILLSWITCH ---
+// Aggiorna solo lo stato grezzo (letto poi da updateKillswitchState() nel
+// loop principale): niente logica di sicurezza dentro l'ISR stessa, per
+// restare rapidissima e per tenere un solo punto (il loop) che decide
+// se/quando fermare il motore.
+void IRAM_ATTR handleKillswitchChange() {
+  bool state = (digitalRead(KILLSWITCH_SENSE_PIN) == HIGH);
+  killswitch_raw_high = state;
+  if (state) {
+    killswitch_last_high_ms = millis();
+  }
+}
 
 
 // --- ENCODER INCREMENTALE ESTERNO (Omron E6B2-CWZ6C, 1200 PPR) ---
@@ -117,6 +158,86 @@ long readEncoderPosition() {
   portEXIT_CRITICAL(&encoder_mux);
   return value;
 }
+
+// --- PULSANTI MANUALI UP/DOWN E JOG ENCODER (controllo manuale fisico) ---
+// Da non confondere con l'encoder incrementale esterno di misura sopra
+// (ENCODER_PIN_A/B/Z, Omron E6B2): il "jog encoder" qui è un dispositivo
+// meccanico separato, dedicato al controllo manuale, con pulsante integrato
+// per selezionare la dimensione dello step. Variabili/funzioni relative
+// prefissate JOG_/jog_ per evitare confusione tra i due encoder.
+
+// Guardia di attivazione condivisa (unico punto di verità) tra pulsanti
+// fisici Up/Down e jog encoder: permessi solo se il motore è realmente
+// fermo (nessun test/homing/GOTO/RETURN_TO_START in corso, quindi anche
+// target_steps_remaining==0, non solo motor_state==STOPPED) e il killswitch
+// non è premuto ORA. Non controlla position_unverified: in stato "giallo"
+// (posizione non verificata ma killswitch rilasciato) il jog manuale deve
+// restare utilizzabile, esattamente come JOG_UP/JOG_DOWN via seriale.
+bool isManualJogAllowed() {
+  return (motor_state == STOPPED) && (target_steps_remaining == 0) && (!killswitch_engaged);
+}
+
+// --- Pulsanti manuali Up/Down (UP_BUTTON_PIN/DOWN_BUTTON_PIN) ---
+const unsigned long BUTTON_DEBOUNCE_MS = 25;
+bool up_button_last_reading = false;
+bool up_button_stable = false;
+unsigned long up_button_last_change_ms = 0;
+bool up_button_owns_jog = false;   // true se è stato questo pulsante ad avviare il jog corrente
+
+bool down_button_last_reading = false;
+bool down_button_stable = false;
+unsigned long down_button_last_change_ms = 0;
+bool down_button_owns_jog = false;
+
+// --- Jog encoder: decodifica quadratura (rotazione) ---
+// Riusa la stessa tabella di decodifica generica ENCODER_QUAD_TABLE già
+// definita sopra per l'encoder esterno (puramente combinatoria, non
+// specifica a un device). ISR minimale: solo incremento/decremento di un
+// contatore volatile, nessuna chiamata a funzioni di movimento qui dentro.
+volatile long jogEncoderCount = 0;
+volatile uint8_t jog_encoder_last_state = 0;
+portMUX_TYPE jog_encoder_mux = portMUX_INITIALIZER_UNLOCKED;
+
+void IRAM_ATTR handleJogEncoderChange() {
+  uint8_t newState = (digitalRead(JOG_ENCODER_A) << 1) | digitalRead(JOG_ENCODER_B);
+  uint8_t index = (jog_encoder_last_state << 2) | newState;
+  int8_t delta = ENCODER_QUAD_TABLE[index];
+
+  portENTER_CRITICAL_ISR(&jog_encoder_mux);
+  jogEncoderCount -= delta; // segno invertito: verificato fisicamente che il
+                            // verso di conteggio "naturale" risulta opposto
+                            // a quello atteso (vedi CLAUDE.md/CHANGELOG.md)
+  portEXIT_CRITICAL_ISR(&jog_encoder_mux);
+
+  jog_encoder_last_state = newState;
+}
+
+// --- Jog encoder: preset di dimensione step (ciclati dal pulsante integrato) ---
+// Valori di partenza indicativi ("fine"/"molto fine"/"finissima"), pensati
+// per essere ritarati su macchina reale: costanti volutamente qui in testa,
+// facilmente modificabili.
+const float JOG_STEP_SIZE_FINE_MM = 0.05f;
+const float JOG_STEP_SIZE_VERY_FINE_MM = 0.01f;
+const float JOG_STEP_SIZE_FINEST_MM = 0.005f;
+const float JOG_STEP_SIZES_MM[3] = { JOG_STEP_SIZE_FINE_MM, JOG_STEP_SIZE_VERY_FINE_MM, JOG_STEP_SIZE_FINEST_MM };
+int jog_step_preset_index = 0; // 0=fine, 1=molto fine, 2=finissima; ciclato da JOG_ENCODER_SW
+
+// Velocità dedicata per i movimenti a step del jog encoder: fissa,
+// deliberatamente più bassa della velocità di jog normale (SET_SPEED), per
+// non perdere passi motore su spostamenti così piccoli (fino a 0.005mm).
+// Valore di partenza prudente, regolabile, da tarare su macchina reale.
+const float JOG_ENCODER_SPEED_MMS = 0.5f;
+
+// --- Jog encoder: pulsante integrato (cambio preset), debounce dedicato ---
+const unsigned long JOG_STEP_BUTTON_DEBOUNCE_MS = 50;
+bool jog_step_button_last_reading = false;
+bool jog_step_button_stable = false;
+unsigned long jog_step_button_last_change_ms = 0;
+
+// --- Jog encoder: stato del movimento a step contati in corso ---
+long jog_step_target_pulse_count = 0;
+bool jog_step_move_active = false;
+long jog_step_saved_pulse_delay_micros = 0; // velocità di jog da ripristinare a fine step
 
 // Cache lettura carico (in grammi)
 volatile float last_load_grams = 0.0f;
@@ -172,6 +293,43 @@ volatile bool lcr_read_in_progress = false; // Flag per evitare richieste multip
 unsigned long last_lcr_request_time = 0; // Per temporizzare le richieste
 const long LCR_REQUEST_INTERVAL_MS = 20; // Interroga LCR max 50 volte/sec (100ms) - Regola se necessario
 
+// --- ADS1220 (ADC esterno SPI, 24 bit) — misura resistenza campioni (piezoresistivo) ---
+// Cablato e verificato (vedi CLAUDE.md per schema alimentazione e circuito di misura
+// ratiometrico a 4 fili). Canale alternativo all'LCR-meter (Serial2 sopra), mai attivi
+// insieme per costruzione della GUI: STATUS "RES_LCR"/"RES_ADS" nel pacchetto D:.
+// Nessun pin DRDY dedicato collegato (nessun GPIO libero rimasto): in modalità di
+// conversione continua (CM=1) il datasheet garantisce che i dati possano essere letti
+// in qualunque momento via RDATA senza rischio di corruzione, riflettendo sempre
+// l'ultima conversione completata — quindi si interroga a intervalli invece che via
+// interrupt hardware (nel peggiore dei casi si rilegge due volte lo stesso campione).
+const int ADS1220_CS_PIN = 5, ADS1220_SCLK_PIN = 21, ADS1220_MOSI_PIN = 26, ADS1220_MISO_PIN = 36;
+const float ADS1220_R_REF_OHM = 989.58f; // valore MISURATO della resistenza di riferimento (REFP0-REFN0), non un placeholder
+SPIClass ads1220SPI(HSPI);
+const SPISettings ADS1220_SPI_SETTINGS(1000000, MSBFIRST, SPI_MODE1); // ADS1220: CPOL=0, CPHA=1
+
+const uint8_t ADS1220_CMD_RESET = 0x06;
+const uint8_t ADS1220_CMD_START = 0x08;
+const uint8_t ADS1220_CMD_RDATA = 0x10;
+const uint8_t ADS1220_CMD_WREG_BASE = 0x40; // 0100 rrnn, rr=registro iniziale, nn=num.registri-1
+
+// Configurazione corrente, validata atomicamente da SET_ADS1220_CONFIG (rifiutato se il
+// canale è in polling: vedi processCommand()). Default allineati agli esempi di registro
+// verificati da datasheet: Reg0=0x38, Reg1=0x84, Reg2=0x47, Reg3=0x20.
+int ads1220_sps = 330;
+int ads1220_gain = 16;
+bool ads1220_pga_bypass = false;         // richiesta utente; ha effetto solo se gain<8
+bool ads1220_pga_bypass_applied = false; // valore realmente scritto nel registro (forzato false se gain>=8)
+int ads1220_idac_ua = 1500;
+int ads1220_window = 10; // campioni della media mobile, max ADS1220_MAX_WINDOW
+bool ads1220_polling_enabled = false;
+
+const int ADS1220_MAX_WINDOW = 20;
+volatile float last_ads1220_resistance_ohm = -999.0f;
+float ads1220_avg_buffer[ADS1220_MAX_WINDOW];
+int ads1220_avg_count = 0;
+int ads1220_avg_index = 0;
+unsigned long ads1220_last_read_time = 0;
+
 // --- PROTOTIPI ---
 void handleHardwareInputs();
 void startMotor(bool up);
@@ -184,6 +342,16 @@ void handleDataStreaming();
 bool readLoadNonBlocking(float* result);
 float averageLoadOverMs(unsigned long duration_ms);
 void updateLCRReading();
+void updateKillswitchState();
+void onKillswitchTriggered();
+void onKillswitchCleared();
+void handleJogEncoderMotion();
+void handleJogStepButton();
+void ads1220WriteReg(uint8_t reg, uint8_t value);
+uint8_t ads1220ReadReg(uint8_t reg);
+int32_t ads1220ReadData();
+void applyAds1220Config();
+void updateADS1220Reading();
 
 void setup()
 {
@@ -210,6 +378,32 @@ void setup()
   attachInterrupt(digitalPinToInterrupt(ENCODER_PIN_B), handleEncoderChange, CHANGE);
   attachInterrupt(digitalPinToInterrupt(ENCODER_PIN_Z), handleEncoderZChange, CHANGE);
 
+  // --- JOG ENCODER: controllo manuale fisico (non l'encoder esterno sopra) ---
+  pinMode(JOG_ENCODER_A, INPUT_PULLUP);
+  pinMode(JOG_ENCODER_B, INPUT_PULLUP);
+  pinMode(JOG_ENCODER_SW, INPUT_PULLUP);
+  // Stato iniziale, per non generare un delta spurio alla prima transizione.
+  jog_encoder_last_state = (digitalRead(JOG_ENCODER_A) << 1) | digitalRead(JOG_ENCODER_B);
+  attachInterrupt(digitalPinToInterrupt(JOG_ENCODER_A), handleJogEncoderChange, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(JOG_ENCODER_B), handleJogEncoderChange, CHANGE);
+
+  // --- KILLSWITCH: stato iniziale letto PRIMA di attaccare l'interrupt, per
+  // sapere subito (anche a boot) se è già premuto. Nessun INPUT_PULLUP: GPIO39
+  // è input-only e privo di pull interni, il pull-up 10k verso 3.3V è esterno.
+  pinMode(KILLSWITCH_SENSE_PIN, INPUT);
+  bool killswitch_initial_high = (digitalRead(KILLSWITCH_SENSE_PIN) == HIGH);
+  killswitch_raw_high = killswitch_initial_high;
+  killswitch_last_high_ms = millis();
+  killswitch_engaged = killswitch_initial_high;
+  // Se il killswitch è già premuto all'avvio (es. riavvio durante
+  // un'emergenza), la posizione va considerata non verificata fin da subito,
+  // esattamente come dopo un trigger normale a macchina già accesa.
+  position_unverified = killswitch_initial_high;
+  attachInterrupt(digitalPinToInterrupt(KILLSWITCH_SENSE_PIN), handleKillswitchChange, CHANGE);
+  if (killswitch_engaged) {
+    Serial.println("STATUS:KILLSWITCH_TRIGGERED");
+  }
+
   Wire.begin(LOADCELL_SDA_PIN, LOADCELL_SCL_PIN);
   scale.begin(Wire);
   scale.setGain(NAU7802_GAIN_128); // Esplicito per chiarezza (coincide col default interno di begin())
@@ -217,6 +411,21 @@ void setup()
   scale.calibrateAFE();
   scale.setCalibrationFactor(1.0);
   // Nessun auto-zero: la cella va sempre ri-tarata dopo il boot (comportamento invariato)
+
+  // --- ADS1220: init SPI (pin custom via GPIO matrix) e reset del chip ---
+  pinMode(ADS1220_CS_PIN, OUTPUT);
+  digitalWrite(ADS1220_CS_PIN, HIGH); // idle
+  ads1220SPI.begin(ADS1220_SCLK_PIN, ADS1220_MISO_PIN, ADS1220_MOSI_PIN, ADS1220_CS_PIN);
+  delay(1); // margine su t_STARTUP dopo power-up prima del primo comando
+  ads1220SPI.beginTransaction(ADS1220_SPI_SETTINGS);
+  digitalWrite(ADS1220_CS_PIN, LOW);
+  ads1220SPI.transfer(ADS1220_CMD_RESET);
+  digitalWrite(ADS1220_CS_PIN, HIGH);
+  ads1220SPI.endTransaction();
+  delay(1); // margine su t_RESET
+  applyAds1220Config(); // scrive i registri di default; il canale resta comunque
+                         // spento (ads1220_polling_enabled=false) finché non
+                         // arriva ENABLE_ADS1220_POLLING
 
   // Timer hardware: prescaler 80 → 1 tick = 1 µs
   stepTimer = timerBegin(0, 80, true);
@@ -228,6 +437,10 @@ void setup()
 
 void loop()
 {
+  // Killswitch: sempre attivo, indipendente da motor_state/comms_mode,
+  // valutato per primo a ogni giro di loop (vedi updateKillswitchState()).
+  updateKillswitchState();
+
   // --- NUOVO BLOCCO PER GESTIRE IL COMPLETAMENTO DEL MOVIMENTO ---
   if (move_completed_flag) {
     // --- CORREZIONE ---
@@ -247,8 +460,11 @@ void loop()
   handleSerialCommands();
   handleDataStreaming();
   updateMotorState();
-  //handleHardwareInputs();  TEMPORANEAMENTE DISABILITATO TASTI FISICI
+  handleHardwareInputs();     // pulsanti manuali fisici Up/Down (riabilitato in questa sessione)
+  handleJogEncoderMotion();   // consumo del delta accumulato dal jog encoder (movimento a step)
+  handleJogStepButton();      // pulsante integrato del jog encoder (cambio preset di step)
   updateLCRReading();
+  updateADS1220Reading();
 }
 
 // --- Gestione seriale non bloccante ---
@@ -315,6 +531,19 @@ void processCommand(const String &command)
       return; // Esci subito
   }
 
+  else if (command == "ENABLE_ADS1220_POLLING") {
+      applyAds1220Config(); // (ri)applica la config corrente e riavvia le conversioni
+      ads1220_polling_enabled = true;
+      ads1220_last_read_time = 0;
+      Serial.println("STATUS:ADS1220_POLLING_ENABLED");
+      return;
+  } else if (command == "DISABLE_ADS1220_POLLING") {
+      ads1220_polling_enabled = false;
+      last_ads1220_resistance_ohm = -999.0f;
+      Serial.println("STATUS:ADS1220_POLLING_DISABLED");
+      return;
+  }
+
   else if (command == "STOP")
   {
     bool was_monotonic = (motor_state == MONOTONIC_TEST);
@@ -358,9 +587,11 @@ void processCommand(const String &command)
     Serial.print(";");
     Serial.print("0");                // 4. Cycle - Fittizio
     Serial.print(";");
-    Serial.print(last_lcr_resistance, 4); // 5. Resistance
+    Serial.print(last_lcr_resistance, 4); // 5. Resistance (RES_LCR)
     Serial.print(";");
-    Serial.println(readEncoderPosition()); // 6. Encoder count (grezzo, sola lettura)
+    Serial.print(readEncoderPosition()); // 6. Encoder count (grezzo, sola lettura)
+    Serial.print(";");
+    Serial.println(last_ads1220_resistance_ohm, 4); // 7. Resistance (RES_ADS)
   }
   else if (command == "TARE")
   {
@@ -523,23 +754,127 @@ void processCommand(const String &command)
   {
     Serial.println("STATUS:FILTER_CONFIG;ALPHA=" + String(filter_alpha, 3) + ";RATE=" + String(filter_rate_sps) + ";GAIN=" + String(filter_pga_gain));
   }
+  else if (command.startsWith("SET_ADS1220_CONFIG:"))
+  {
+    // Configurabile solo a canale fermo: evita discontinuità/artefatti sui dati
+    // di un test in corso (race fra scrittura registri e conversione a metà,
+    // cambio del divisore di conversione non sincrono col cambio gain, media
+    // mobile con finestra che cambia a buffer pieno).
+    if (ads1220_polling_enabled) {
+      Serial.println("STATUS:ADS1220_CONFIG_REJECTED;REASON=POLLING_ACTIVE");
+    } else {
+      String params = command.substring(19); // len("SET_ADS1220_CONFIG:") == 19
+      int sps_idx = params.indexOf("SPS=");
+      int gain_idx = params.indexOf("GAIN=");
+      int bypass_idx = params.indexOf("PGA_BYPASS=");
+      int idac_idx = params.indexOf("IDAC=");
+      int window_idx = params.indexOf("WINDOW=");
+
+      bool valid = (sps_idx != -1 && gain_idx != -1 && bypass_idx != -1 && idac_idx != -1 && window_idx != -1);
+      int new_sps = 0, new_gain = 0, new_idac = 0, new_window = 0;
+      bool new_bypass_requested = false;
+
+      if (valid) {
+        new_sps = params.substring(sps_idx + 4, params.indexOf(';', sps_idx)).toInt();
+        new_gain = params.substring(gain_idx + 5, params.indexOf(';', gain_idx)).toInt();
+        new_bypass_requested = (params.substring(bypass_idx + 11, params.indexOf(';', bypass_idx)).toInt() != 0);
+        new_idac = params.substring(idac_idx + 5, params.indexOf(';', idac_idx)).toInt();
+        new_window = params.substring(window_idx + 7).toInt();
+
+        valid = (new_sps == 20 || new_sps == 45 || new_sps == 90 || new_sps == 175 ||
+                 new_sps == 330 || new_sps == 600 || new_sps == 1000) &&
+                (new_gain == 1 || new_gain == 2 || new_gain == 4 || new_gain == 8 ||
+                 new_gain == 16 || new_gain == 32 || new_gain == 64 || new_gain == 128) &&
+                (new_idac == 0 || new_idac == 10 || new_idac == 50 || new_idac == 100 ||
+                 new_idac == 250 || new_idac == 500 || new_idac == 1000 || new_idac == 1500) &&
+                (new_window >= 1 && new_window <= ADS1220_MAX_WINDOW);
+      }
+
+      if (valid) {
+        ads1220_sps = new_sps;
+        ads1220_gain = new_gain;
+        ads1220_pga_bypass = new_bypass_requested;
+        ads1220_idac_ua = new_idac;
+        ads1220_window = new_window;
+        applyAds1220Config(); // scrive i registri (forza PGA attivo se gain>=8), riavvia le conversioni
+
+        // PGA_BYPASS riportato qui è il valore REALMENTE applicato (ads1220_pga_bypass_applied),
+        // non necessariamente quello richiesto: se gain>=8 il firmware ignora silenziosamente
+        // la richiesta di bypass (PGA sempre attivo per datasheet) e lo segnala così, senza
+        // rifiutare il comando per questo.
+        Serial.println("STATUS:ADS1220_CONFIG_SET;SPS=" + String(ads1220_sps) +
+                        ";GAIN=" + String(ads1220_gain) +
+                        ";PGA_BYPASS=" + String(ads1220_pga_bypass_applied ? 1 : 0) +
+                        ";IDAC=" + String(ads1220_idac_ua) +
+                        ";WINDOW=" + String(ads1220_window));
+      } else {
+        Serial.println("STATUS:ADS1220_CONFIG_REJECTED;REASON=OUT_OF_RANGE");
+      }
+    }
+  }
+  else if (command == "GET_ADS1220_CONFIG")
+  {
+    Serial.println("STATUS:ADS1220_CONFIG;SPS=" + String(ads1220_sps) +
+                    ";GAIN=" + String(ads1220_gain) +
+                    ";PGA_BYPASS=" + String(ads1220_pga_bypass_applied ? 1 : 0) +
+                    ";IDAC=" + String(ads1220_idac_ua) +
+                    ";WINDOW=" + String(ads1220_window));
+  }
+  else if (command == "DEBUG_ADS1220")
+  {
+    // Diagnostica temporanea (da rimuovere a valutazione completata, stesso
+    // pattern di DEBUG_RAW_KILLSWITCH usato in passato): rilegge i 4
+    // registri via RREG (per verificare che le WREG di applyAds1220Config()
+    // siano realmente arrivate al chip) e fa una RDATA immediata, a
+    // prescindere da ads1220_polling_enabled.
+    uint8_t r0 = ads1220ReadReg(0);
+    uint8_t r1 = ads1220ReadReg(1);
+    uint8_t r2 = ads1220ReadReg(2);
+    uint8_t r3 = ads1220ReadReg(3);
+    int32_t raw = ads1220ReadData();
+    float r_x = ((float)raw / (8388608.0f * (float)ads1220_gain)) * ADS1220_R_REF_OHM;
+    Serial.print("STATUS:ADS1220_DEBUG;REG0=0x"); Serial.print(r0, HEX);
+    Serial.print(";REG1=0x"); Serial.print(r1, HEX);
+    Serial.print(";REG2=0x"); Serial.print(r2, HEX);
+    Serial.print(";REG3=0x"); Serial.print(r3, HEX);
+    Serial.print(";RAW="); Serial.print(raw);
+    Serial.print(";RES="); Serial.println(r_x, 4);
+  }
+  else if (command == "GET_KILLSWITCH_STATE")
+  {
+    Serial.println("STATUS:KILLSWITCH_STATE;ENGAGED=" + String(killswitch_engaged ? 1 : 0) +
+                    ";POSITION_UNVERIFIED=" + String(position_unverified ? 1 : 0));
+  }
   else if (command == "RETURN_TO_START")
   {
-    long delta = start_pulse_count - pulse_count;  // quanti passi servono per tornare
-    if (delta == 0) {
-      Serial.println("STATUS:RETURN_COMPLETED");
+    // Stessa guardia di GOTO, per lo stesso motivo: si basa su pulse_count,
+    // non più affidabile mentre la posizione non è verificata (stato
+    // "giallo" o "rosso"). Un HOME riuscito è l'unico modo per sbloccarlo.
+    if (position_unverified) {
+      Serial.println("STATUS:GOTO_REJECTED;REASON=POSITION_UNVERIFIED");
     } else {
-      bool up = (delta > 0);
-      setMotorSpeed(default_return_speed_mms);     // imposta la velocità di ritorno
-      target_steps_remaining = labs(delta);
-      dir_up = up;
-      digitalWrite(DIR_PIN, up ? HIGH : LOW);
-      motor_enabled = true;
-      Serial.println("STATUS:RETURNING");
+      long delta = start_pulse_count - pulse_count;  // quanti passi servono per tornare
+      if (delta == 0) {
+        Serial.println("STATUS:RETURN_COMPLETED");
+      } else {
+        bool up = (delta > 0);
+        setMotorSpeed(default_return_speed_mms);     // imposta la velocità di ritorno
+        target_steps_remaining = labs(delta);
+        dir_up = up;
+        digitalWrite(DIR_PIN, up ? HIGH : LOW);
+        motor_enabled = true;
+        Serial.println("STATUS:RETURNING");
+      }
     }
   }
   else if (command.startsWith("START_CYCLIC_TEST:"))
   {
+    // Bloccato mentre la posizione non è verificata (stato "giallo" o
+    // "rosso"): un HOME riuscito è l'unico modo per sbloccare l'avvio prove.
+    if (position_unverified) {
+      Serial.println("STATUS:TEST_START_REJECTED;REASON=POSITION_UNVERIFIED");
+      return;
+    }
     // Serial.println("\n[DEBUG CYCLIC] Entrato nel blocco START_CYCLIC_TEST."); // <-- DEBUG 1
     target_steps_remaining = 0;
     // Esempio comando: "START_CYCLIC_TEST:MODE=DISP;UPPER=50.0;LOWER=10.0;SPEED=5.0;HOLD_U=1000;HOLD_L=500;CYCLES=100"
@@ -700,6 +1035,12 @@ void processCommand(const String &command)
   }
   else if (command.startsWith("START_TEST:"))
   {
+    // Bloccato mentre la posizione non è verificata (stato "giallo" o
+    // "rosso"): un HOME riuscito è l'unico modo per sbloccare l'avvio prove.
+    if (position_unverified) {
+      Serial.println("STATUS:TEST_START_REJECTED;REASON=POSITION_UNVERIFIED");
+      return;
+    }
     target_steps_remaining = 0;
     String params = command.substring(11);
     int speed_idx = params.indexOf("SPEED_MMS=");
@@ -734,12 +1075,23 @@ void processCommand(const String &command)
     limit_hit_notification_sent = false; // <-- ABBASSA LA BANDIERINA QUI
 
     if (command == "JOG_UP") {
-      motor_state = JOG_UP;
-      startMotor(true);
+      // Permesso in stato "giallo" (position_unverified ma killswitch non
+      // premuto ora), bloccato solo in stato "rosso" (killswitch_engaged).
+      // Stessa regola da riusare per i futuri JOG fisici (pulsanti/encoder).
+      if (!killswitch_engaged) {
+        motor_state = JOG_UP;
+        startMotor(true);
+      } else {
+        Serial.println("STATUS:JOG_REJECTED;REASON=KILLSWITCH_ENGAGED");
+      }
     }
     else if (command == "JOG_DOWN") {
-      motor_state = JOG_DOWN;
-      startMotor(false);
+      if (!killswitch_engaged) {
+        motor_state = JOG_DOWN;
+        startMotor(false);
+      } else {
+        Serial.println("STATUS:JOG_REJECTED;REASON=KILLSWITCH_ENGAGED");
+      }
     }
     else if (command == "HOME") {
       motor_state = HOMING;
@@ -760,18 +1112,24 @@ void processCommand(const String &command)
       // usato da RETURN_TO_START: non introduce un nuovo MotorState, resta
       // STOPPED per tutta la durata del movimento (STOP/'!' lo interrompono
       // sempre azzerando target_steps_remaining, vedi sopra).
-      float target_mm = command.substring(5).toFloat();
-      if (target_mm >= 0) {
-        long target_steps = (long)(target_mm / PULSES_TO_MM);
-        long delta = target_steps - pulse_count;
-        if (delta == 0) {
-          Serial.println("STATUS:MOVE_COMPLETED");
-        } else {
-          dir_up = (delta > 0);
-          digitalWrite(DIR_PIN, dir_up ? HIGH : LOW);
-          target_steps_remaining = labs(delta);
-          motor_enabled = true;
-          Serial.println("STATUS:GOTO_STARTED");
+      // Bloccato mentre la posizione non è verificata (stato "giallo" o
+      // "rosso"): l'unico modo per uscirne è un HOME riuscito.
+      if (position_unverified) {
+        Serial.println("STATUS:GOTO_REJECTED;REASON=POSITION_UNVERIFIED");
+      } else {
+        float target_mm = command.substring(5).toFloat();
+        if (target_mm >= 0) {
+          long target_steps = (long)(target_mm / PULSES_TO_MM);
+          long delta = target_steps - pulse_count;
+          if (delta == 0) {
+            Serial.println("STATUS:MOVE_COMPLETED");
+          } else {
+            dir_up = (delta > 0);
+            digitalWrite(DIR_PIN, dir_up ? HIGH : LOW);
+            target_steps_remaining = labs(delta);
+            motor_enabled = true;
+            Serial.println("STATUS:GOTO_STARTED");
+          }
         }
       }
     }
@@ -779,31 +1137,150 @@ void processCommand(const String &command)
 }
 
 
-// --- Lettura pulsanti hardware ---
+// --- Lettura pulsanti manuali fisici Up/Down (con debounce software) ---
+// Riusa esattamente la stessa funzione di movimento (startMotor()/stopMotor())
+// già usata da JOG_UP/JOG_DOWN via seriale: nessuna nuova logica di
+// movimento, solo un nuovo modo di attivarla. Guardia di attivazione
+// condivisa con il jog encoder: isManualJogAllowed() (unico punto di
+// verità, vedi sopra). Se la guardia non è soddisfatta, il pulsante non fa
+// nulla (nessun comando/messaggio inviato al PC).
 void handleHardwareInputs()
 {
-  if (motor_state == MONOTONIC_TEST) return;  // durante il test monotono ignora i jog
+  unsigned long now = millis();
 
-  bool up_pressed   = (digitalRead(UP_BUTTON_PIN) == LOW);
-  bool down_pressed = (digitalRead(DOWN_BUTTON_PIN) == LOW);
+  // --- Pulsante UP ---
+  bool up_raw = (digitalRead(UP_BUTTON_PIN) == LOW);
+  if (up_raw != up_button_last_reading) {
+    up_button_last_reading = up_raw;
+    up_button_last_change_ms = now;
+  } else if (now - up_button_last_change_ms >= BUTTON_DEBOUNCE_MS && up_raw != up_button_stable) {
+    up_button_stable = up_raw;
+    if (up_button_stable) {
+      if (isManualJogAllowed()) {
+        motor_state = JOG_UP;
+        is_hardware_jog_active = true;
+        up_button_owns_jog = true;
+        startMotor(true);
+      }
+    } else if (up_button_owns_jog) {
+      // Rilascio: ferma esattamente come il rilascio del JOG da GUI (che
+      // invia il comando STOP). Se il motore è già stato fermato da
+      // un'altra causa nel frattempo (endstop, limite, killswitch), ci
+      // limitiamo a richiudere la contabilità senza toccarlo di nuovo.
+      up_button_owns_jog = false;
+      is_hardware_jog_active = false;
+      if (motor_state == JOG_UP) {
+        motor_state = STOPPED;
+        stopMotor();
+        Serial.println("STATUS:STOPPED_BY_USER");
+      }
+    }
+  }
 
-  if (up_pressed)
-  {
-    motor_state = JOG_UP;
-    is_hardware_jog_active = true;
-    startMotor(true);   // avvia motore verso l’alto
+  // --- Pulsante DOWN (stessa logica, direzione opposta) ---
+  bool down_raw = (digitalRead(DOWN_BUTTON_PIN) == LOW);
+  if (down_raw != down_button_last_reading) {
+    down_button_last_reading = down_raw;
+    down_button_last_change_ms = now;
+  } else if (now - down_button_last_change_ms >= BUTTON_DEBOUNCE_MS && down_raw != down_button_stable) {
+    down_button_stable = down_raw;
+    if (down_button_stable) {
+      if (isManualJogAllowed()) {
+        motor_state = JOG_DOWN;
+        is_hardware_jog_active = true;
+        down_button_owns_jog = true;
+        startMotor(false);
+      }
+    } else if (down_button_owns_jog) {
+      down_button_owns_jog = false;
+      is_hardware_jog_active = false;
+      if (motor_state == JOG_DOWN) {
+        motor_state = STOPPED;
+        stopMotor();
+        Serial.println("STATUS:STOPPED_BY_USER");
+      }
+    }
   }
-  else if (down_pressed)
-  {
-    motor_state = JOG_DOWN;
-    is_hardware_jog_active = true;
-    startMotor(false);  // avvia motore verso il basso
+}
+
+// --- Jog encoder: consumo del delta accumulato (movimento a step contati) ---
+// Chiamato ogni giro di loop(). Se un movimento a step è già in corso, ne
+// segue solo il completamento (o l'interruzione per un'altra causa:
+// endstop, limite assoluto, killswitch — già tutte gestite altrove; qui ci
+// limitiamo a richiudere la contabilità). Se non c'è un movimento in corso,
+// converte il delta in sospeso (se non zero e se la guardia lo permette) in
+// un singolo movimento relativo di (delta * step_size_corrente), usando
+// esattamente lo stesso motor_state JOG_UP/JOG_DOWN e la stessa startMotor()
+// già usati dal jog normale — eredita così automaticamente lo stesso
+// controllo di endstop e limiti assoluti applicato in updateMotorState()
+// (a differenza del meccanismo target_steps_remaining usato da GOTO, che
+// non viene qui utilizzato proprio per non perdere quel controllo). Se la
+// guardia non è soddisfatta o un movimento precedente è ancora in corso, il
+// delta resta accumulato nel contatore (non viene consumato né perso) fino
+// al turno in cui potrà essere gestito correttamente.
+void handleJogEncoderMotion() {
+  if (jog_step_move_active) {
+    if (motor_state != JOG_UP && motor_state != JOG_DOWN) {
+      // Il movimento si è fermato per un'altra ragione (endstop, limite
+      // assoluto, killswitch, STOP/'!'): richiudi solo la contabilità, il
+      // motore è già fermo.
+      jog_step_move_active = false;
+      is_hardware_jog_active = false;
+      pulse_delay_micros = jog_step_saved_pulse_delay_micros;
+      timerAlarmWrite(stepTimer, pulse_delay_micros, true);
+    } else if ((dir_up && pulse_count >= jog_step_target_pulse_count) ||
+               (!dir_up && pulse_count <= jog_step_target_pulse_count)) {
+      motor_state = STOPPED;
+      stopMotor();
+      jog_step_move_active = false;
+      is_hardware_jog_active = false;
+      pulse_delay_micros = jog_step_saved_pulse_delay_micros;
+      timerAlarmWrite(stepTimer, pulse_delay_micros, true);
+    }
+    return; // non iniziare un nuovo movimento finché questo non è concluso
   }
-  else if (is_hardware_jog_active)
-  {
-    is_hardware_jog_active = false;
-    motor_state = STOPPED;
-    stopMotor();        // ferma subito i passi
+
+  long delta;
+  portENTER_CRITICAL(&jog_encoder_mux);
+  delta = jogEncoderCount;
+  portEXIT_CRITICAL(&jog_encoder_mux);
+
+  if (delta == 0) return;
+  if (!isManualJogAllowed()) return; // resta in coda, consumato quando la guardia lo permetterà
+
+  portENTER_CRITICAL(&jog_encoder_mux);
+  jogEncoderCount -= delta; // consuma solo il delta effettivamente usato
+  portEXIT_CRITICAL(&jog_encoder_mux);
+
+  float step_mm = JOG_STEP_SIZES_MM[jog_step_preset_index];
+  long steps = lround((double)labs(delta) * step_mm / PULSES_TO_MM);
+  if (steps <= 0) return; // non dovrebbe accadere con i preset attuali
+
+  bool up = (delta > 0);
+  jog_step_saved_pulse_delay_micros = pulse_delay_micros; // per ripristinare la velocità di jog normale a fine step
+  setMotorSpeed(JOG_ENCODER_SPEED_MMS);
+  jog_step_target_pulse_count = pulse_count + (up ? steps : -steps);
+  jog_step_move_active = true;
+  is_hardware_jog_active = true;
+  motor_state = up ? JOG_UP : JOG_DOWN;
+  startMotor(up);
+}
+
+// --- Jog encoder: pulsante integrato, ciclo dei 3 preset di dimensione step ---
+void handleJogStepButton() {
+  unsigned long now = millis();
+  bool raw_pressed = (digitalRead(JOG_ENCODER_SW) == LOW);
+
+  if (raw_pressed != jog_step_button_last_reading) {
+    jog_step_button_last_reading = raw_pressed;
+    jog_step_button_last_change_ms = now;
+  } else if (now - jog_step_button_last_change_ms >= JOG_STEP_BUTTON_DEBOUNCE_MS &&
+             raw_pressed != jog_step_button_stable) {
+    jog_step_button_stable = raw_pressed;
+    if (jog_step_button_stable) { // fronte di pressione
+      jog_step_preset_index = (jog_step_preset_index + 1) % 3;
+      Serial.println("STATUS:JOG_STEP_SIZE_SET;MM=" + String(JOG_STEP_SIZES_MM[jog_step_preset_index], 4));
+    }
   }
 }
 
@@ -819,6 +1296,58 @@ void startMotor(bool up) {
 void stopMotor() {
   motor_enabled = false;
   //Serial.println("DEBUG: stopMotor() chiamato");
+}
+
+// --- KILLSWITCH: gestione stato e reazioni ---
+void onKillswitchTriggered() {
+  // Stesso path già usato per lo stop di emergenza esistente ('!'): ferma
+  // subito qualunque movimento motore in corso, in QUALUNQUE motor_state
+  // (jog, homing, test monotonico/ciclico), e riporta in POLLING.
+  bool was_monotonic = (motor_state == MONOTONIC_TEST);
+  bool was_cyclic = (motor_state == CYCLIC_TEST);
+  bool was_test = was_monotonic || was_cyclic;
+
+  motor_state = STOPPED;
+  comms_mode = POLLING;
+  stopMotor();
+  target_steps_remaining = 0; // azzera un eventuale movimento a passi contati (GOTO/RETURN_TO_START)
+
+  position_unverified = true;
+
+  Serial.println("STATUS:KILLSWITCH_TRIGGERED");
+  if (was_test) {
+    // Pacchetto dedicato (distinto da TEST_STOPPED_BY_USER/CYCLIC_TEST_STOPPED_BY_USER,
+    // che implicano uno stop volontario dell'utente): permette al software Python
+    // di chiudere il file della prova mantenendo tutti i dati già acquisiti,
+    // marcandolo come interrotto da killswitch e non come completato/stoppato normalmente.
+    Serial.println("STATUS:TEST_ABORTED;REASON=KILLSWITCH");
+  }
+}
+
+void onKillswitchCleared() {
+  Serial.println("STATUS:KILLSWITCH_CLEARED");
+  // position_unverified resta true: solo un HOME completato con successo lo
+  // riporta a false (vedi HOMING_FINAL_LIFT in updateMotorState()).
+}
+
+void updateKillswitchState() {
+  bool raw_high = killswitch_raw_high;
+  unsigned long last_high = killswitch_last_high_ms;
+
+  if (raw_high) {
+    // Pressione: rilevamento immediato, nessun debounce.
+    if (!killswitch_engaged) {
+      killswitch_engaged = true;
+      onKillswitchTriggered();
+    }
+  } else if (killswitch_engaged && (millis() - last_high >= KILLSWITCH_RELEASE_DEBOUNCE_MS)) {
+    // Rilascio: solo dopo ~200ms di stato stabile a LOW (nessun fronte a
+    // HIGH nel frattempo, altrimenti killswitch_last_high_ms si sarebbe
+    // aggiornato di nuovo), per non scambiare un rimbalzo meccanico in
+    // rilascio per un vero rilascio.
+    killswitch_engaged = false;
+    onKillswitchCleared();
+  }
 }
 
 void setMotorSpeed(float speed_mms) {
@@ -886,6 +1415,140 @@ void updateLCRReading() {
         }
         // Altrimenti (nessuna risposta ancora e non in timeout), non fare nulla e aspetta ancora
     }
+}
+
+// --- ADS1220: SPI a basso livello ---
+void ads1220WriteReg(uint8_t reg, uint8_t value) {
+  ads1220SPI.beginTransaction(ADS1220_SPI_SETTINGS);
+  digitalWrite(ADS1220_CS_PIN, LOW);
+  ads1220SPI.transfer(ADS1220_CMD_WREG_BASE | (reg << 2)); // nn=00 -> scrive 1 solo registro
+  ads1220SPI.transfer(value);
+  digitalWrite(ADS1220_CS_PIN, HIGH);
+  ads1220SPI.endTransaction();
+}
+
+// Rilettura di un registro via RREG — usata solo da DEBUG_ADS1220 (diagnostica
+// temporanea) per verificare che le scritture WREG di applyAds1220Config()
+// siano realmente arrivate al chip.
+uint8_t ads1220ReadReg(uint8_t reg) {
+  ads1220SPI.beginTransaction(ADS1220_SPI_SETTINGS);
+  digitalWrite(ADS1220_CS_PIN, LOW);
+  ads1220SPI.transfer(0x20 | (reg << 2)); // RREG, nn=00 -> legge 1 solo registro
+  uint8_t value = ads1220SPI.transfer(0x00);
+  digitalWrite(ADS1220_CS_PIN, HIGH);
+  ads1220SPI.endTransaction();
+  return value;
+}
+
+// Legge l'ultima conversione via RDATA (sicuro in continuous conversion mode
+// anche senza pin DRDY, vedi commento sui globali ADS1220 sopra) e la
+// sign-extende da 24 a 32 bit.
+int32_t ads1220ReadData() {
+  ads1220SPI.beginTransaction(ADS1220_SPI_SETTINGS);
+  digitalWrite(ADS1220_CS_PIN, LOW);
+  ads1220SPI.transfer(ADS1220_CMD_RDATA);
+  uint32_t b0 = ads1220SPI.transfer(0x00);
+  uint32_t b1 = ads1220SPI.transfer(0x00);
+  uint32_t b2 = ads1220SPI.transfer(0x00);
+  digitalWrite(ADS1220_CS_PIN, HIGH);
+  ads1220SPI.endTransaction();
+  uint32_t raw = (b0 << 16) | (b1 << 8) | b2;
+  if (raw & 0x800000) raw |= 0xFF000000; // segno su 24 bit -> sign-extend a 32
+  return (int32_t)raw;
+}
+
+// Scrive i 4 registri di configurazione a partire dai parametri correnti
+// (ads1220_sps/gain/pga_bypass/idac/window) e riavvia le conversioni con
+// START/SYNC — necessario in continuous conversion mode dopo aver scritto i
+// registri, altrimenti la nuova configurazione non viene applicata alla
+// conversione in corso. Chiamata sia da ENABLE_ADS1220_POLLING sia da un
+// SET_ADS1220_CONFIG riuscito (quest'ultimo è comunque bloccato mentre il
+// canale è già in polling, vedi processCommand()).
+void applyAds1220Config() {
+  uint8_t gain_bits;
+  switch (ads1220_gain) {
+    case 1: gain_bits = 0; break; case 2: gain_bits = 1; break;
+    case 4: gain_bits = 2; break; case 8: gain_bits = 3; break;
+    case 16: gain_bits = 4; break; case 32: gain_bits = 5; break;
+    case 64: gain_bits = 6; break; default: gain_bits = 7; break; // 128
+  }
+  uint8_t dr_bits;
+  switch (ads1220_sps) {
+    case 20: dr_bits = 0; break; case 45: dr_bits = 1; break;
+    case 90: dr_bits = 2; break; case 175: dr_bits = 3; break;
+    case 330: dr_bits = 4; break; case 600: dr_bits = 5; break;
+    default: dr_bits = 6; break; // 1000
+  }
+  uint8_t idac_bits;
+  switch (ads1220_idac_ua) {
+    case 0: idac_bits = 0; break; case 10: idac_bits = 1; break;
+    case 50: idac_bits = 2; break; case 100: idac_bits = 3; break;
+    case 250: idac_bits = 4; break; case 500: idac_bits = 5; break;
+    case 1000: idac_bits = 6; break; default: idac_bits = 7; break; // 1500
+  }
+
+  // PGA_BYPASS ha effetto solo per gain<8: per gain>=8 il PGA deve restare
+  // sempre attivo (obbligatorio da datasheet), qualunque fosse la richiesta.
+  ads1220_pga_bypass_applied = (ads1220_gain < 8) ? ads1220_pga_bypass : false;
+
+  // Reg0: MUX=0011 (AIN1-AIN2 differenziale, fisso) | GAIN (3 bit) | PGA_BYPASS (1 bit)
+  uint8_t reg0 = (0b0011 << 4) | (gain_bits << 1) | (ads1220_pga_bypass_applied ? 1 : 0);
+  // Reg1: DR (3 bit) | MODE=00 (Normal, fisso) | CM=1 (continuous, fisso) | TS=0 | BCS=0
+  uint8_t reg1 = (dr_bits << 5) | (0b00 << 3) | (1 << 2);
+  // Reg2: VREF=01 (esterno REFP0/REFN0, fisso) | 50/60=00 (filtro sempre spento, obbligatorio
+  // da datasheet per SPS != 20 in Normal mode; tenuto spento anche a 20 SPS) | PSW=0 | IDAC (3 bit)
+  uint8_t reg2 = (0b01 << 6) | (0b00 << 4) | idac_bits;
+  // Reg3: I1MUX=001 (IDAC1->AIN0/REFP1, fisso) | I2MUX=000 (disabilitato, fisso) | DRDYM=0 | RESERVED=0
+  uint8_t reg3 = (0b001 << 5);
+
+  ads1220WriteReg(0, reg0);
+  ads1220WriteReg(1, reg1);
+  ads1220WriteReg(2, reg2);
+  ads1220WriteReg(3, reg3);
+
+  ads1220SPI.beginTransaction(ADS1220_SPI_SETTINGS);
+  digitalWrite(ADS1220_CS_PIN, LOW);
+  ads1220SPI.transfer(ADS1220_CMD_START);
+  digitalWrite(ADS1220_CS_PIN, HIGH);
+  ads1220SPI.endTransaction();
+
+  // La finestra della media mobile può essere cambiata solo a canale fermo
+  // (vedi guardia in processCommand()): azzerare qui è sempre sicuro.
+  ads1220_avg_count = 0;
+  ads1220_avg_index = 0;
+  ads1220_last_read_time = 0;
+}
+
+// Interrogazione a intervalli (RDATA), rate-limitata al sample rate corrente:
+// interrogare più veloce di quanto il chip produca nuovi campioni è sicuro in
+// continuous conversion mode (si rilegge al più due volte lo stesso valore),
+// ma inutile, quindi ci si allinea al periodo di conversione per non sprecare
+// cicli di loop() / banda SPI. Media mobile su ads1220_window campioni.
+void updateADS1220Reading() {
+  if (!ads1220_polling_enabled) {
+    last_ads1220_resistance_ohm = -999.0f;
+    return;
+  }
+
+  unsigned long now = millis();
+  unsigned long interval_ms = 1000UL / (unsigned long)ads1220_sps;
+  if (interval_ms < 1) interval_ms = 1;
+  if (now - ads1220_last_read_time < interval_ms) return;
+  ads1220_last_read_time = now;
+
+  int32_t raw = ads1220ReadData();
+  // R_x = (rawData / (2^23 * gain)) * R_ref — il valore di IDAC non entra nella
+  // formula (si semplifica ratiometricamente, stessa corrente attraversa R_ref
+  // e R_x in serie): influisce solo su rumore/autoriscaldamento del campione.
+  float r_x = ((float)raw / (8388608.0f * (float)ads1220_gain)) * ADS1220_R_REF_OHM;
+
+  ads1220_avg_buffer[ads1220_avg_index] = r_x;
+  ads1220_avg_index = (ads1220_avg_index + 1) % ads1220_window;
+  if (ads1220_avg_count < ads1220_window) ads1220_avg_count++;
+
+  float sum = 0.0f;
+  for (int i = 0; i < ads1220_avg_count; i++) sum += ads1220_avg_buffer[i];
+  last_ads1220_resistance_ohm = sum / (float)ads1220_avg_count;
 }
 
 void updateMotorState()
@@ -1026,6 +1689,10 @@ void updateMotorState()
         // Finalizza lo stato di homing
         motor_state = STOPPED;
         comms_mode = POLLING; // Torna in polling
+        // Un HOME riuscito è l'unico modo per uscire da position_unverified
+        // (impostato true da un trigger del killswitch, o dal boot se era
+        // già premuto all'avvio).
+        position_unverified = false;
         Serial.println("STATUS:HOMING_COMPLETED");
         Serial.println("STATUS:HOMED"); // Segnala che la macchina è pronta
 
@@ -1298,9 +1965,11 @@ void handleDataStreaming() {
       Serial.print(";");
       Serial.print(cyclic_current_cycle);
       Serial.print(";");
-      Serial.print(last_lcr_resistance, 4);
+      Serial.print(last_lcr_resistance, 4); // RES_LCR
       Serial.print(";");
-      Serial.println(readEncoderPosition());
+      Serial.print(readEncoderPosition());
+      Serial.print(";");
+      Serial.println(last_ads1220_resistance_ohm, 4); // RES_ADS
     }
   }
 }
