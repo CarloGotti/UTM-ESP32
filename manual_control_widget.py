@@ -1,4 +1,4 @@
-from PyQt6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel, QDoubleSpinBox, QGridLayout, QFileDialog, QMessageBox, QCheckBox
+from PyQt6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel, QDoubleSpinBox, QGridLayout, QFileDialog, QMessageBox, QComboBox
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QFont
 
@@ -14,6 +14,10 @@ from data_saver import DataSaver
 class ManualControlWidget(QWidget):
     back_to_menu_requested = pyqtSignal()
     limits_button_requested = pyqtSignal()
+    # Emesso quando l'utente cambia il selettore "Sorgente Resistenza"
+    # ("OFF"/"LCR"/"ADS1220"): MainWindow lo usa per tracciare centralmente
+    # se il canale ADS1220 è attivo (gating del dialog impostazioni).
+    resistance_source_changed = pyqtSignal(str)
     
     def __init__(self, communicator, parent=None):
         super().__init__(parent)
@@ -38,9 +42,23 @@ class ManualControlWidget(QWidget):
 
 
         self.MIN_SPEED, self.MAX_SPEED = 0.01, 25.0
+        # Stato killswitch (vedi CLAUDE.md): il jog software resta utilizzabile
+        # in stato "giallo" (position_unverified ma killswitch non premuto ora),
+        # disabilitato solo in stato "rosso" (killswitch premuto). Predisposto
+        # per essere riusato anche dai futuri jog fisici (pulsanti/encoder).
+        self._killswitch_engaged = False
+        self._position_unverified = False
         self.is_homed = False; self.absolute_load_N = 0.0; self.load_offset_N = 0.0
         self.absolute_displacement_mm = 0.0; self.displacement_offset_mm = 0.0
-        self.current_resistance_ohm = -999.0 # Per memorizzare l'ultimo valore LCR
+        # Resistenza campioni: due canali alternativi (LCR-meter esterno / ADS1220),
+        # mai attivi insieme (vedi resistance_source_combo). current_resistance_ohm
+        # è il valore della sorgente attualmente selezionata, usato da display/grafico;
+        # current_resistance_lcr_ohm/current_resistance_ads_ohm sono i valori grezzi
+        # dell'ultimo pacchetto D: ricevuto, propagati da MainWindow indipendentemente
+        # da quale sia selezionata qui.
+        self.current_resistance_ohm = -999.0
+        self.current_resistance_lcr_ohm = -999.0
+        self.current_resistance_ads_ohm = -999.0
         self.absolute_encoder_displacement_mm = None # Canale encoder esterno (sola lettura, Livello 1)
         self.encoder_displacement_offset_mm = 0.0 # Zero relativo del canale encoder
 
@@ -56,6 +74,13 @@ class ManualControlWidget(QWidget):
         self.resistance_display = DisplayWidget("Resistance (Ω)")
         self.encoder_disp_display = DisplayWidget("Encoder Displacement (mm)")
         self.rel_encoder_disp_display = DisplayWidget("Relative Enc. Displacement (mm)")
+        # Dimensione step corrente del jog encoder fisico (pulsanti/encoder a
+        # bordo macchina, funzionano anche a GUI chiusa/PC scollegato): solo
+        # display informativo, aggiornato da STATUS:JOG_STEP_SIZE_SET quando
+        # l'operatore cambia preset dal pulsante integrato. Valore iniziale
+        # allineato al preset di default del firmware (0=fine, 0.05mm).
+        self.jog_step_size_display = DisplayWidget("Jog Encoder Step (mm)")
+        self.jog_step_size_display.set_value("0.0500")
 
         self.up_button = QPushButton("↑ UP ↑"); self.down_button = QPushButton("↓ DOWN ↓")
         
@@ -120,6 +145,7 @@ class ManualControlWidget(QWidget):
         display_layout.addWidget(self.resistance_display)
         display_layout.addWidget(self.encoder_disp_display)
         display_layout.addWidget(self.rel_encoder_disp_display)
+        display_layout.addWidget(self.jog_step_size_display)
         left_vbox = QVBoxLayout(); speed_label_title = QLabel("Jog Speed:"); speed_label_title.setFont(general_font)
         left_vbox.addWidget(self.up_button); left_vbox.addWidget(self.down_button); left_vbox.addSpacing(20)
         left_vbox.addWidget(speed_label_title); left_vbox.addWidget(self.speed_spinbox); left_vbox.addWidget(self.speed_bar)
@@ -146,8 +172,11 @@ class ManualControlWidget(QWidget):
         # Aggiungi il nuovo layout al layout principale
         main_layout.addLayout(graph_section_layout, 1, 0, 1, 2)
 
-        self.lcr_enable_checkbox = QCheckBox("Enable LCR Reading")
-        functions_layout.addWidget(self.lcr_enable_checkbox)
+        self.resistance_source_label = QLabel("Resistance Source:")
+        self.resistance_source_combo = QComboBox()
+        self.resistance_source_combo.addItems(["Off", "LCR", "ADS1220"])
+        functions_layout.addWidget(self.resistance_source_label)
+        functions_layout.addWidget(self.resistance_source_combo)
 
         # --- FINE NUOVO LAYOUT --
 
@@ -167,17 +196,19 @@ class ManualControlWidget(QWidget):
         self.rec_button.clicked.connect(self.on_rec_button_clicked)
         self.time_window_spinbox.valueChanged.connect(self.on_time_window_changed)
         self.plot_update_timer.timeout.connect(self._update_plot)
-        self.lcr_enable_checkbox.stateChanged.connect(self._on_lcr_checkbox_changed)
+        self.resistance_source_combo.currentTextChanged.connect(self._on_resistance_source_changed)
         self._setup_resistance_axis()
         # --- FINE ---
         self.update_displays(); self.update_speed_controls()
 
-    def handle_stream_data(self, load_N, disp_mm, time_s, cycle_count, resistance_ohm, encoder_disp_mm=None):
+    def handle_stream_data(self, load_N, disp_mm, time_s, cycle_count, resistance_lcr_ohm, resistance_ads_ohm, encoder_disp_mm=None):
              # Se la schermata non è visibile, non fare nulla
         if not self.isVisible():
             self.plot_start_time = 0 # Resetta il tempo se la schermata viene nascosta
             return
-        self.current_resistance_ohm = resistance_ohm
+        self.current_resistance_lcr_ohm = resistance_lcr_ohm
+        self.current_resistance_ads_ohm = resistance_ads_ohm
+        self.current_resistance_ohm = self._current_active_resistance_ohm()
         self.absolute_encoder_displacement_mm = encoder_disp_mm
 
         # Inizializza il tempo di partenza al primo dato ricevuto
@@ -189,17 +220,18 @@ class ManualControlWidget(QWidget):
             self.plot_resistance_data.clear()
 
         elapsed_time = time.time() - self.plot_start_time
-        self.current_resistance_ohm = resistance_ohm
-    
+
         self.plot_time_data.append(elapsed_time)
         self.plot_force_data.append(load_N)
-        self.plot_resistance_data.append(resistance_ohm if resistance_ohm >= 0 else np.nan)
+        self.plot_resistance_data.append(self.current_resistance_ohm if self.current_resistance_ohm >= 0 else np.nan)
 
         # Se la registrazione è attiva, salva tutti i dati
         if self.is_recording:
             relative_disp = disp_mm - self.displacement_offset_mm
             relative_load = load_N - self.load_offset_N
-            self.recorded_data.append((elapsed_time, relative_disp, relative_load, disp_mm, load_N, resistance_ohm, encoder_disp_mm))
+            resistance_source = self.resistance_source_combo.currentText().upper()
+            self.recorded_data.append((elapsed_time, relative_disp, relative_load, disp_mm, load_N,
+                                        self.current_resistance_ohm, encoder_disp_mm, resistance_source))
 
     # Aggiungi questo nuovo metodo privato alla classe
     def _update_plot(self):
@@ -314,6 +346,12 @@ class ManualControlWidget(QWidget):
 
     def set_calibration_status(self, status_text):
         self.calib_status_display.set_value(status_text)
+
+    def set_jog_step_size(self, step_mm):
+        """ Chiamato da MainWindow su STATUS:JOG_STEP_SIZE_SET (cambio preset
+        dal pulsante integrato del jog encoder fisico). Solo display, nessuna
+        azione: il preset è gestito interamente dal firmware. """
+        self.jog_step_size_display.set_value(f"{step_mm:.4f}")
     
     def send_command(self, command):
         self.communicator.send_command(command)
@@ -325,13 +363,12 @@ class ManualControlWidget(QWidget):
     def toggle_homing(self):
         """ NUOVA VERSIONE: gestisce l'avvio e l'arresto dell'homing, inclusa l'interruzione. """
         if not self.is_homing_active:
-            # Inizia l'homing
+            # Inizia l'homing (sempre permesso, anche in stato giallo/rosso: è
+            # l'unico modo per uscire da "posizione non verificata" — vedi CLAUDE.md)
             self.send_command("HOME")
             self.homing_button.setText("STOP Homing")
-            # Disabilita gli altri controlli di movimento per sicurezza
-            self.up_button.setEnabled(False)
-            self.down_button.setEnabled(False)
             self.is_homing_active = True
+            self.update_jog_enabled()
         else:
             # Interrompi l'homing
             self.send_command("STOP")
@@ -343,10 +380,23 @@ class ManualControlWidget(QWidget):
     def reset_homing_ui(self):
         """ NUOVA FUNZIONE: ripristina l'interfaccia dopo l'homing (o l'interruzione). """
         self.homing_button.setText("HOMING")
-        self.up_button.setEnabled(True)
-        self.down_button.setEnabled(True)
         self.is_homing_active = False
-        
+        self.update_jog_enabled()
+
+    def set_killswitch_state(self, engaged, position_unverified):
+        """ Chiamato da MainWindow a ogni transizione di stato del killswitch. """
+        self._killswitch_engaged = engaged
+        self._position_unverified = position_unverified
+        self.update_jog_enabled()
+
+    def update_jog_enabled(self):
+        """ Jog Up/Down: disabilitato solo in stato "rosso" (killswitch premuto
+        ora) o durante un homing attivo; resta invece utilizzabile in stato
+        "giallo" (position_unverified ma non premuto). """
+        enabled = (not self.is_homing_active) and (not self._killswitch_engaged)
+        self.up_button.setEnabled(enabled)
+        self.down_button.setEnabled(enabled)
+
     def zero_relative_load(self): self.load_offset_N = self.absolute_load_N; self.update_displays()
     def zero_relative_displacement(self):
         self.displacement_offset_mm = self.absolute_displacement_mm
@@ -391,16 +441,37 @@ class ManualControlWidget(QWidget):
             relative_encoder_disp = self.absolute_encoder_displacement_mm - self.encoder_displacement_offset_mm
             self.rel_encoder_disp_display.set_value(f"{relative_encoder_disp:.4f}")
 
-    def _on_lcr_checkbox_changed(self, state):
-        """ Invia il comando appropriato all'ESP32 quando il checkbox cambia stato. """
-        if state == Qt.CheckState.Checked.value:
-            #print("DEBUG GUI (Manual): Abilitazione LCR Polling")
+    def _current_active_resistance_ohm(self):
+        """ Valore di resistenza della sorgente attualmente selezionata nel
+        combo (o -999.0 se "Off" o nessun dato ancora ricevuto per quella
+        sorgente). """
+        source = self.resistance_source_combo.currentText()
+        if source == "LCR":
+            return self.current_resistance_lcr_ohm
+        elif source == "ADS1220":
+            return self.current_resistance_ads_ohm
+        return -999.0
+
+    def _on_resistance_source_changed(self, text):
+        """ Invia ENABLE_*/DISABLE_* al cambio di sorgente: LCR e ADS1220 non
+        sono mai richiesti attivi insieme (vedi CLAUDE.md), quindi ogni
+        cambio abilita al più una sorgente e disabilita esplicitamente
+        l'altra. """
+        if text == "LCR":
             self.send_command("ENABLE_LCR_POLLING")
-        else:
-            #print("DEBUG GUI (Manual): Disabilitazione LCR Polling")
+            self.send_command("DISABLE_ADS1220_POLLING")
+        elif text == "ADS1220":
+            self.send_command("ENABLE_ADS1220_POLLING")
             self.send_command("DISABLE_LCR_POLLING")
-            # Resetta subito il display
-            self.current_resistance_ohm = -999.0
+        else:  # "Off"
+            self.send_command("DISABLE_LCR_POLLING")
+            self.send_command("DISABLE_ADS1220_POLLING")
+        # Evita di mostrare/salvare un valore residuo della sorgente precedente
+        # finché non arriva un dato fresco per quella nuova.
+        self.current_resistance_lcr_ohm = -999.0
+        self.current_resistance_ads_ohm = -999.0
+        self.current_resistance_ohm = -999.0
+        self.resistance_source_changed.emit(text.upper())
         self._setup_resistance_axis()
         self.update_displays()
 
@@ -421,7 +492,7 @@ class ManualControlWidget(QWidget):
             return
         # --- FINE BLOCCO DI SICUREZZA ---
 
-        lcr_enabled = self.lcr_enable_checkbox.isChecked()
+        lcr_enabled = (self.resistance_source_combo.currentText() != "Off")
 
         # --- Rimuovi elementi esistenti ---
         if self.resistance_axis_viewbox:

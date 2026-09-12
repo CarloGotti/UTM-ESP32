@@ -16,7 +16,10 @@ class SettingsManager:
                 "100N": [0.0, 1398.0],
                 "200N": [0.0, 1398.0]
             },
-            "filter_config": {"alpha": 0.5, "rate_sps": 320, "gain": 128}
+            "filter_config": {"alpha": 0.5, "rate_sps": 320, "gain": 128},
+            # Default allineati ai valori di registro ADS1220 verificati da datasheet
+            # (vedi CLAUDE.md): Reg0=0x38, Reg1=0x84, Reg2=0x47, Reg3=0x20.
+            "ads1220_config": {"sps": 330, "gain": 16, "pga_bypass": False, "idac_ua": 1500, "window": 10}
         }
 
     def load_settings(self):

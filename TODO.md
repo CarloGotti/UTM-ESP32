@@ -74,7 +74,20 @@ risoluzione temporale più alta.
    `handleEncoderZChange()` su Z) che si aggiungono a quella del timer di
    step: il loro overhead a velocità di traversa elevate non è stato
    ancora misurato, quindi la validazione di `STREAM_INTERVAL_MS` andrebbe
-   rifatta tenendone conto, non solo del carico NAU7802.
+   rifatta tenendone conto, non solo del carico NAU7802. **Idem per il
+   polling SPI dell'ADS1220** (`updateADS1220Reading()`, vedi `CLAUDE.md`
+   sezione ADS1220): stima teorica di impatto trascurabile (poche decine di
+   µs per lettura `RDATA`, rate-limitata al sample rate configurato), ma
+   **il jitter di `loop()` a velocità non è ancora mai stato misurato su
+   hardware reale**. In una sessione successiva è stata fatta una prima
+   verifica fisica del canale ADS1220 (registri confermati corretti via
+   `DEBUG_ADS1220`, lettura di un resistore di prova funzionante — vedi
+   `CHANGELOG.md`), ma **solo a motore fermo**, via diagnosi seriale
+   diretta: non copre questo punto. Da fare: misurare il jitter reale su
+   `STREAM_INTERVAL_MS` e sulla cadenza di step motore con il canale
+   ADS1220 attivo a piena velocità di traversa (idealmente insieme alla
+   misura dell'overhead encoder, unico giro di test), prima di un uso in
+   produzione ad alta velocità con quel canale abilitato.
 3. **Il costo reale è lato Python/GUI, non sul firmware o sul cavo**:
    - `handle_data_from_esp32()` → `handle_stream_data()` farebbe ~6.4×
      più `append()` sulla lista dati e più `setData()` su curve pyqtgraph
@@ -94,6 +107,44 @@ si sposterebbe sul carico di lavoro Python (grafici live, dimensione file
 di export) più che sul firmware o sul cavo. Da affrontare solo se serve
 davvero una risoluzione temporale più alta per l'analisi dei dati; non è
 un prerequisito della migrazione NAU7802 già completata.
+
+## ADS1220: range di resistenza misurabile limitato dal riferimento fisico fisso
+
+**Verificato su hardware reale** (vedi `CHANGELOG.md`): il range massimo di
+resistenza misurabile è `R_ref / gain`, indipendente da `IDAC`. Con l'attuale
+`R_ref = 989.58 Ω`, il tetto assoluto è **~990 Ω** (a `GAIN=1`, il minimo
+disponibile) — oltre quella soglia l'ADC satura a fondo scala e la lettura
+resta bloccata allo stesso valore, indistinguibile da un circuito aperto.
+Non è configurabile via `SET_ADS1220_CONFIG`: `R_ref` è un resistore fisico
+saldato sul circuito di misura.
+
+**Per campioni con resistenza attesa fuori da questo range** (es. l'utente
+ha indicato la necessità di coprire 1 Ω–10 kΩ per nanofibre con coating
+conduttivo), due strade discusse ma non implementate:
+
+1. **Sostituire il resistore di riferimento** con uno più grande (es.
+   ~10-12 kΩ, misurato con precisione e aggiornato in `ADS1220_R_REF_OHM`),
+   scelto in base al limite superiore atteso dei campioni. A `GAIN=1` questo
+   coprirebbe l'intero range fino al nuovo `R_ref` in un colpo solo; il
+   rumore/risoluzione dell'ADC a quel gain resta ampiamente sufficiente per
+   risolvere anche il lato basso (1 Ω) del range, ma andrebbe confermato
+   sperimentalmente col nuovo resistore installato.
+2. **Banco di resistenze di riferimento commutabili** (idea proposta
+   dall'utente, per coprire più decadi senza dover scegliere un singolo
+   compromesso): un multiplexer analogico (es. CD4051, 8 canali) tra
+   `REFP0`/`REFN0` e una serie di resistori (es. 10 Ω/100 Ω/1 kΩ/10 kΩ/100
+   kΩ), pilotato da GPIO liberi, con firmware che seleziona/consiglia il
+   canale in base all'ultima lettura. Non ancora scoperto un pin plan
+   completo: sull'attuale mappa GPIO (vedi `CLAUDE.md`, tabella pinout) solo
+   `GPIO15` risulta chiaramente libero e sicuro da riusare; pilotare anche
+   solo 3 linee di selezione per un mux ad 8 canali richiederebbe liberare
+   altri pin o aggiungere un espansore I2C/SPI. In più, la resistenza ON del
+   mux (tipicamente decine di Ω, variabile con temperatura) si somma in
+   serie al resistore selezionato e andrebbe caratterizzata/calibrata per
+   non introdurre errore sistematico, soprattutto sulle decadi più basse.
+
+Nessuna delle due strade è stata implementata in questa sessione: richiede
+una decisione dell'utente su component/pin plan prima di procedere.
 
 ## Conteggio giri Z dell'encoder esterno, decodificato ma non esposto
 
@@ -115,6 +166,39 @@ l'integrazione):
 Se nessuno di questi usi si materializza, valutare se rimuovere del tutto
 la decodifica Z (oggi codice morto lato funzionalità, anche se a costo
 quasi nullo) per ridurre la superficie del firmware.
+
+## Jog encoder: verifica fisica pendente e possibile scaling per scatto (detent)
+
+**Stato attuale**: pulsanti manuali Up/Down e jog encoder sono stati
+integrati in firmware (vedi `CHANGELOG.md`, voce più recente) e il
+firmware è stato caricato e verificato passivamente (boot pulito,
+`GET_KILLSWITCH_STATE`/`GET_DATA` rispondono correttamente). **Non ancora
+verificato con un uso fisico reale dei pulsanti/encoder** (nessun comando
+di movimento inviato in questa sessione dopo l'upload, per non muovere la
+traversa senza supervisione diretta).
+
+**Da verificare fisicamente prima di un uso in produzione** (vedi
+`CLAUDE.md`, sezione "Pulsanti manuali e jog encoder fisici", punto 4 dei
+compromessi, per il dettaglio):
+1. Verso di rotazione dell'encoder ora corretto (l'inversione era stata
+   corretta "a tavolino" invertendo il segno in ISR, non ancora confermata
+   girando fisicamente l'encoder).
+2. Killswitch premuto mentre un pulsante è fisicamente tenuto premuto o
+   l'encoder è a metà di un movimento a step: il motore deve fermarsi
+   subito, e il sistema deve restare utilizzabile dopo (nessun blocco
+   residuo dei comandi seriali).
+3. Taratura dei 3 preset di step (0.05/0.01/0.005 mm nominali) rispetto al
+   movimento realmente osservato.
+
+**Possibile scaling per "scatto" (detent) dell'encoder**: il firmware oggi
+applica `step_size_corrente` per ogni singolo conteggio di quadratura
+grezzo (`jogEncoderCount`), non per scatto meccanico. Se l'encoder fisico
+genera più conteggi per scatto (comune sugli encoder economici EC11-style,
+tipicamente 4 conteggi/scatto), il movimento per click risulterebbe un
+multiplo (es. ×4) del preset nominale. Da verificare al punto 3 sopra; se
+confermato, valutare se dividere il delta per un fattore
+`JOG_ENCODER_COUNTS_PER_DETENT` (nuova costante) prima di convertirlo in
+passi, invece di ritarare solo i tre preset per compensare.
 
 ## Altri punti aperti (dai `docs/*.md` e da `CLAUDE.md`)
 

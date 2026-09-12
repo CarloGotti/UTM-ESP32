@@ -4,6 +4,549 @@ Riepilogo concettuale dei cambiamenti architetturali e delle correzioni
 rilevanti al progetto. Non è un log riga-per-riga dei commit: per quello si
 veda la cronologia git. Ogni voce spiega **cosa** è cambiato e **perché**.
 
+## 2026-07-21
+
+### Feature: ADS1220 (ADC SPI) integrato per la misura di resistenza dei campioni, canale alternativo all'LCR-meter
+
+Cablaggio già fatto e verificato in una sessione di pianificazione precedente
+(non toccato qui): regolatore LP5907 per `AVDD`/`DVDD`, circuito di misura
+ratiometrico a 4 fili (`AIN0`/`AIN1` su un elettrodo, `AIN2`/`AIN3` sull'altro,
+`AIN3` cortocircuitato a `REFP0`, resistenza di riferimento **misurata**
+`R_ref = 989.58 Ω` fra `REFP0`/`REFN0`), SPI su `CS`=GPIO5, `SCLK`=GPIO21,
+`MOSI`=GPIO26, `MISO`=GPIO36 (pin già riservati in precedenza, ora spostati
+dalla sezione "non ancora cablati" a "cablati e integrati" in `CLAUDE.md`).
+**Non è un canale di sicurezza**: sola lettura (Livello 1), stesso
+trattamento del canale encoder esterno — non tocca limiti assoluti né
+criteri di stop.
+
+**Ragionamento sul DRDY (perché non serve un pin dedicato)**: il chip non ha
+un GPIO libero per il pin `DRDY` (GPIO4, l'unico "naturale", è già `DIR_PIN`
+del motore). Verificato dal datasheet ADS1220 che in modalità di conversione
+continua (`CM=1`) i dati possono essere letti in qualunque momento via
+`RDATA` senza rischio di corruzione, riflettendo sempre l'ultima conversione
+completata — quindi si interroga a intervalli (rate-limitati al sample rate
+configurato) invece che via interrupt hardware, senza perdita di
+correttezza (al più si rilegge lo stesso campione due volte).
+
+**Correzioni ai valori di registro rispetto a descrizioni imprecise
+circolate prima della sessione di implementazione**: i valori di registro
+usati (`Reg0=0x38`, `Reg1=0x84`, `Reg2=0x47`, `Reg3=0x20`) sono stati
+riverificati bit-per-bit contro il datasheet reale prima di scriverli nel
+firmware — in particolare il guadagno PGA di default è **16x, non 1x** come
+descritto in una versione precedente non verificata, e il filtro 50/60Hz
+(`Reg2` bit 5:4) resta **sempre spento** (obbligatorio per SPS≠20 in Normal
+mode, tenuto spento anche a 20 SPS per semplicità, dato che nessun caso
+d'uso richiede il filtro attivo).
+
+**Firmware** (`Controllo-Macchina-ESP32/src/main.cpp`):
+- Driver SPI a basso livello (`SPIClass` su pin custom via GPIO matrix,
+  `ads1220WriteReg()`/`ads1220ReadData()`) e `applyAds1220Config()` che
+  traduce i parametri correnti (`ads1220_sps`/`gain`/`pga_bypass`/`idac_ua`)
+  nei 4 byte di registro e riavvia le conversioni (`START/SYNC`,
+  necessario dopo una scrittura ai registri in continuous conversion mode).
+  `PGA_BYPASS` forzato a `false` (`ads1220_pga_bypass_applied`) se
+  `gain>=8`, obbligatorio da datasheet, qualunque fosse la richiesta.
+- `updateADS1220Reading()`, chiamata da `loop()` come `updateLCRReading()`:
+  rate-limitata a `1000/SPS` ms, calcola `R_x = (rawData / (2^23 * gain)) *
+  R_ref` (l'IDAC non entra nella formula, si semplifica ratiometricamente)
+  e applica una media mobile su buffer circolare (`ads1220_window`
+  campioni, default 10, max 20).
+- Comandi nuovi: `ENABLE_ADS1220_POLLING`/`DISABLE_ADS1220_POLLING` (stesso
+  pattern degli equivalenti LCR); `SET_ADS1220_CONFIG:SPS=..;GAIN=..;
+  PGA_BYPASS=..;IDAC=..;WINDOW=..` (validazione atomica come
+  `SET_FILTER_CONFIG`, **rifiutato** con
+  `STATUS:ADS1220_CONFIG_REJECTED;REASON=POLLING_ACTIVE` se il canale è
+  attualmente in polling — evita discontinuità/artefatti su un test in
+  corso); `GET_ADS1220_CONFIG`.
+- Pacchetto `D:` esteso da 6 a **7 campi**: rinominato concettualmente il
+  5° campo in `RES_LCR` (invariato) e aggiunto un 7° campo `RES_ADS` in
+  coda (stesso schema di sentinel: `-999`=disabilitato, `-2`=errore
+  parsing). Aggiunto sia alla risposta di `GET_DATA` sia allo streaming.
+
+**Python**:
+- `main.py`: parsing esteso a 7 campi (con tolleranza retrocompatibile
+  alle varianti storiche a 3/4/5/6, come già per l'encoder); propaga
+  entrambi i valori grezzi (`current_resistance_lcr_ohm`/
+  `current_resistance_ads_ohm`) a tutti i widget; gestisce
+  `STATUS:ADS1220_CONFIG_SET`/`_REJECTED`/`ADS1220_CONFIG` (allinea lo
+  stato GUI ai valori **realmente applicati** dal firmware, segnalando
+  esplicitamente con un popup se `PGA_BYPASS` è stato ignorato per
+  `gain>=8x`); traccia centralmente `active_resistance_source` (via nuovo
+  segnale `resistance_source_changed` emesso da ciascun widget) al solo
+  scopo di disabilitare il dialog "ADS1220 Settings" mentre il canale è
+  attivo su una qualunque schermata.
+- `manual_control_widget.py`/`monotonic_test_widget.py`/
+  `cyclic_test_widget.py`: il checkbox "Enable LCR Reading" è sostituito
+  da un combo box "Sorgente Resistenza" ("Off"/"LCR"/"ADS1220"), stesso
+  schema nelle tre schermate; il cambio selezione invia sempre la coppia
+  `ENABLE_*`/`DISABLE_*` corretta (mai LCR e ADS1220 richiesti attivi
+  insieme). Il grafico/display "Resistance (Ω)" esistente (già generico,
+  non richiedeva modifiche) è ora alimentato da qualunque dei due campi
+  arrivi, in base alla sorgente selezionata — nessun overlay delle due
+  curve (a differenza di Motor/Encoder displacement): sono alternative,
+  non complementari. Le tuple dati (`current_test_data`/`recorded_data`)
+  guadagnano un campo finale con la sorgente attiva ("LCR"/"ADS1220"/
+  "OFF"), senza spostare gli indici esistenti (append in coda).
+- `custom_widgets.py`: nuovo `ADS1220ConfigDialog` (sul modello di
+  `FilterConfigDialog`), aperto da un nuovo pulsante "ADS1220 Settings"
+  nel menu principale; `MainWindow` lo apre solo se il canale non è
+  attualmente attivo, con un messaggio esplicativo altrimenti (il
+  firmware lo rifiuterebbe comunque, ma evitiamo di far compilare un form
+  che verrà scartato).
+- `data_saver.py`: nuova colonna "Resistance Source" accanto a
+  "Resistance (Ohm)" nei file Excel esportati.
+- `settings_manager.py`: nuova chiave `ads1220_config` persistita in
+  `settings.json` (default allineati ai valori di registro sopra).
+
+**Validazione timing richiesta (jitter `STREAM_INTERVAL_MS` e cadenza di
+step motore con canale ADS1220 attivo a piena velocità di traversa):
+NON eseguita** — nessun accesso alla macchina fisica in questa sessione.
+Stima teorica soltanto (vedi `CLAUDE.md`, sezione ADS1220, e `TODO.md`):
+una lettura `RDATA` a 1 MHz SPI dura nell'ordine di poche decine di µs,
+rate-limitata a `1000/SPS` ms, quindi impatto atteso trascurabile su
+`STREAM_INTERVAL_MS` (20 ms); il timer hardware dei passi motore non è
+comunque influenzato da un `loop()` più lento, essendo un interrupt
+hardware indipendente. **Da verificare fisicamente prima di un uso in
+produzione ad alta velocità con questo canale abilitato**, idealmente
+insieme alla misura (anch'essa mai fatta) dell'overhead delle ISR encoder
+già segnalata in `TODO.md`.
+
+### Fix: ADS1220 verificato su hardware reale — bug di parsing `SET_ADS1220_CONFIG` e scoperta del limite di range `R_ref/gain`
+
+Seguito della feature sopra, con accesso reale alla macchina in questa
+sessione (a differenza della validazione timing, ancora non eseguita — vedi
+sotto): firmware compilato ma **non caricato** al primo tentativo (`pio run`
+senza `-t upload`, stesso errore già documentato al punto critico 11 di
+`CLAUDE.md`), poi effettivamente flashato e testato dal vivo.
+
+**Bug 1 — `SET_ADS1220_CONFIG` sempre rifiutato con `REASON=OUT_OF_RANGE`**:
+il parsing usava `command.substring(20)` per isolare i parametri dopo il
+prefisso, ma `"SET_ADS1220_CONFIG:"` è lunga **19** caratteri, non 20 — il
+primo carattere (`S` di `SPS=`) veniva scartato, `params.indexOf("SPS=")`
+falliva sempre (`-1`), e la validazione falliva di conseguenza qualunque
+fossero i valori inviati. Riprodotto subito alla prima connessione reale
+(la GUI invia `SET_ADS1220_CONFIG` automaticamente dopo la connessione).
+Corretto in `command.substring(19)`.
+
+**Bug 2 (falso allarme, diagnosticato con un comando temporaneo) — lettura
+"bloccata" a 61.8487 Ω anche scollegando fisicamente il campione**: aggiunto
+un comando diagnostico temporaneo `DEBUG_ADS1220` (rilegge i 4 registri via
+`RREG` più un campione `RDATA` immediato, a prescindere dal polling) per
+verificare se le scritture `WREG` di `applyAds1220Config()` arrivassero
+davvero al chip. Risultato: registri **corretti** (`0x38 0x84 0x47 0x20`,
+esattamente quelli attesi), ma `RAW=8388607` — cioè `2^23-1`, fondo scala
+positivo. Non è un bug: è la conferma di un vincolo fisico della misura
+ratiometrica, non documentato esplicitamente prima di questa verifica:
+
+```
+R_x,max = R_ref / gain   (indipendente da IDAC)
+```
+
+Con `R_ref = 989.58 Ω` e `gain=16` (default), `R_x,max ≈ 61.85 Ω` — che è
+esattamente il valore "bloccato" osservato: qualunque resistenza (o un
+circuito aperto, resistenza infinita) pari o superiore a quella soglia
+satura allo stesso identico codice di fondo scala, quindi rimuovere il
+campione non cambia nulla se la lettura era già satura. **Verificato poi
+con successo collegando un resistore di valore basso** (ben sotto i 62 Ω):
+lettura corretta e non più bloccata. `DEBUG_ADS1220` resta nel firmware
+come comando diagnostico temporaneo (non in tabella comandi "ufficiale" di
+`CLAUDE.md`, da valutare se rimuovere in seguito).
+
+**Implicazione pratica per l'uso reale**: con l'attuale `R_ref = 989.58 Ω`
+il range massimo assoluto (a `GAIN=1`, il minimo disponibile) è **~990 Ω** —
+non raggiungibile oltre, qualunque configurazione si scelga. Per campioni
+con resistenza attesa fino a 1 Ω–10 kΩ, come discusso con l'utente, servirebbe
+un resistore di riferimento fisicamente più grande (es. ~10-12 kΩ, misurato
+con precisione e riportato in `ADS1220_R_REF_OHM`) — cambio hardware non
+ancora fatto. Discussa anche l'idea di un banco di resistenze di riferimento
+commutabili via multiplexer analogico per coprire più decadi dinamicamente,
+non implementata (vedi `TODO.md`): richiede GPIO liberi (scarsi sull'attuale
+mappa pin) e caratterizzazione della resistenza ON del mux.
+
+**Validazione timing (jitter `STREAM_INTERVAL_MS`/cadenza step a canale
+ADS1220 attivo): ancora NON eseguita** — l'accesso alla macchina in questa
+sessione è stato usato solo per diagnosi via seriale diretta (letture
+ferme, motore non movimentato), non per un test a piena velocità di
+traversa. Resta un passo esplicito da fare, vedi `TODO.md`.
+
+### Feature: pulsanti manuali Up/Down fisici e jog encoder a step fini, integrati in firmware (con display GUI del preset)
+
+Seguito della voce "Hardware: pulsanti manuali, jog encoder e killswitch —
+cablati e verificati, logica firmware non ancora scritta" (più sotto in
+questa stessa data): scritta la logica firmware che legge questo hardware
+(il killswitch era già stato integrato in una sessione precedente, non
+toccato qui se non per leggerne lo stato). Nessuna nuova logica di
+movimento: pulsanti ed encoder riusano deliberatamente le stesse funzioni
+(`startMotor()`/`stopMotor()`) già usate da `JOG_UP`/`JOG_DOWN` via seriale.
+
+**Firmware** (`Controllo-Macchina-ESP32/src/main.cpp`):
+- Nuova guardia di attivazione condivisa, unico punto di verità,
+  `isManualJogAllowed()`: `motor_state == STOPPED` **e**
+  `target_steps_remaining == 0` (esclude anche un `GOTO`/`RETURN_TO_START`
+  in corso, che lascia `motor_state == STOPPED` — controllo più stringente
+  di quello usato oggi da `JOG_UP`/`JOG_DOWN` seriale, introdotto solo per i
+  nuovi input fisici) **e** `!killswitch_engaged` (non controlla
+  `position_unverified`: in stato "giallo" il jog fisico resta utilizzabile,
+  come già per il jog seriale). Usata sia dai pulsanti sia dall'encoder,
+  nessuna copia duplicata.
+- `handleHardwareInputs()` riabilitata (era commentata/disabilitata,
+  `//handleHardwareInputs(); TEMPORANEAMENTE DISABILITATO TASTI FISICI`):
+  polling nel `loop()`, debounce software a transizione ~25ms per
+  `UP_BUTTON_PIN`/`DOWN_BUTTON_PIN`. Pressione (se la guardia lo permette):
+  `motor_state = JOG_UP`/`JOG_DOWN` + `startMotor()`. Rilascio: ferma
+  esattamente come il rilascio del jog da GUI (`motor_state = STOPPED`,
+  `stopMotor()`, `STATUS:STOPPED_BY_USER`), tranne se il motore era già
+  stato fermato nel frattempo da un'altra causa (endstop, limite,
+  killswitch), nel qual caso richiude solo la contabilità senza duplicare
+  il messaggio. Bandierine di "proprietà" per pulsante
+  (`up_button_owns_jog`/`down_button_owns_jog`), necessarie per evitare che
+  `is_hardware_jog_active` (già esistente, blocca `JOG_UP`/`JOG_DOWN`/
+  `HOME`/`SET_SPEED`/`GOTO` seriali durante un jog fisico) resti bloccata a
+  `true` per sempre se il killswitch ferma il motore mentre il pulsante è
+  ancora fisicamente premuto — bug potenziale individuato scrivendo questa
+  logica, risolto senza toccare la logica del killswitch stessa (vedi
+  `CLAUDE.md`, sezione dedicata, per il dettaglio).
+- Jog encoder: decodifica quadratura su interrupt `CHANGE` su
+  `JOG_ENCODER_A`/`JOG_ENCODER_B` (`handleJogEncoderChange()`, ISR minimale,
+  riusa la stessa tabella di decodifica generica `ENCODER_QUAD_TABLE` già
+  esistente per l'encoder esterno). **Verso di conteggio invertito** rispetto
+  al segno "naturale" della tabella, per correggere l'inversione verificata
+  fisicamente in una sessione precedente (sottrazione del delta invece di
+  somma, equivalente allo scambio dei pin A/B ma senza toccare il cablaggio).
+  Consumo nel `loop()` (`handleJogEncoderMotion()`): converte l'intero delta
+  accumulato in un movimento relativo di `delta × step_size_corrente`,
+  impostando `motor_state = JOG_UP`/`JOG_DOWN` (**non** il meccanismo a passi
+  contati `target_steps_remaining` di `GOTO`/`RETURN_TO_START`, che salta il
+  controllo endstop ad ogni giro di loop) — scelta deliberata per ereditare
+  esattamente lo stesso controllo di endstop e limiti assoluti del jog
+  normale, monitorando un target di `pulse_count` assoluto per fermarsi da
+  solo. Se la guardia non è soddisfatta o un movimento precedente è ancora
+  in corso, il delta resta accumulato (letto/sottratto atomicamente in
+  sezione critica) senza essere perso né duplicato.
+  Velocità dedicata fissa e più bassa (`JOG_ENCODER_SPEED_MMS = 0.5 mm/s`,
+  costante regolabile) per non perdere passi su spostamenti così piccoli:
+  la velocità del timer passi viene salvata prima di ogni step e ripristinata
+  subito dopo (anche se il movimento viene interrotto da endstop/limite/
+  killswitch), per non lasciare la macchina a velocità ridotta per i jog
+  successivi.
+- Tre preset di step ciclati dal pulsante integrato dell'encoder
+  (`JOG_ENCODER_SW`, debounce dedicato ~50ms, indipendente da quello di
+  rotazione): costanti regolabili in testa al file
+  (`JOG_STEP_SIZE_FINE_MM=0.05`, `JOG_STEP_SIZE_VERY_FINE_MM=0.01`,
+  `JOG_STEP_SIZE_FINEST_MM=0.005`), convertite in passi motore con la
+  costante `PULSES_TO_MM` già esistente (nessuna nuova costante meccanica).
+  Alla pressione, nuovo messaggio `STATUS:JOG_STEP_SIZE_SET;MM=<valore>`.
+
+**Python**: `MainWindow.handle_data_from_esp32()` inoltra
+`STATUS:JOG_STEP_SIZE_SET` a un nuovo
+`ManualControlWidget.set_jog_step_size()`, che aggiorna un nuovo
+`DisplayWidget` ("Jog Encoder Step (mm)") — puro display informativo,
+nessuna azione lato GUI: il preset è gestito interamente dal firmware e
+funziona anche a GUI chiusa/PC scollegato, come da richiesta.
+
+**Verifica effettuata**: compilazione firmware (`pio run`, successo, RAM
+6.9% / Flash 24.5%, footprint sostanzialmente invariato); sintassi Python
+verificata (`py_compile` su `main.py` e `manual_control_widget.py`). Nessun
+hardware reale disponibile in questa sessione per verificare fisicamente:
+l'inversione A/B corretta, la taratura dei preset di step, e il
+comportamento del killswitch premuto durante un jog fisico attivo — tutti
+da fare come prossimo passo prima di un uso reale (vedi `CLAUDE.md`,
+sezione dedicata, "Compromessi e rischi residui noti", per il dettaglio
+completo, incluso un possibile fattore ×4 tra conteggi di quadratura grezzi
+e "scatti" meccanici dell'encoder se questo genera 4 conteggi/scatto).
+
+### Diagnosi: "software non funziona" dopo il primo flash — causa non software (scheda mai flashata, poi guasto hardware sul killswitch)
+
+Dopo l'integrazione del killswitch (voce successiva in questo changelog),
+l'utente ha segnalato che l'intero software non funzionava più: GUI
+apparentemente connessa ma nessun dato in calibrazione, nessun movimento
+motore (nemmeno l'homing). Diagnosticato passo per passo, senza modificare
+codice all'inizio:
+
+1. Ascolto passivo della porta seriale (nessun comando di movimento
+   inviato): **zero byte ricevuti dall'ESP32**, né al boot né in risposta a
+   `GET_DATA`/`GET_KILLSWITCH_STATE`. Causa: il firmware con il killswitch
+   era stato solo **compilato**, mai **caricato** sulla scheda in questa
+   sessione — quello effettivamente in esecuzione non emetteva output
+   utilizzabile (stato imprecisato, indipendente dalle modifiche fatte).
+2. Verificato con `esptool.py chip_id` (comunica col bootloader ROM,
+   nessuna modifica alla flash) che il chip stesso era vivo e rispondeva
+   correttamente — escludendo una scheda danneggiata o USB non funzionante.
+3. Con conferma esplicita dell'utente, caricato il firmware compilato
+   (`pio run -t upload`): da quel momento boot pulito, `GET_DATA` e
+   `GET_KILLSWITCH_STATE` rispondono correttamente. Causa risolta.
+
+**Secondo problema, emerso testando lo scenario "boot con killswitch
+premuto"**: indicatore rimasto verde anche a killswitch tenuto premuto, e
+successivi azionamenti fisici del killswitch completamente ignorati
+("sordo"). Diagnosticato aggiungendo un comando seriale temporaneo
+(`DEBUG_RAW_KILLSWITCH`, poi rimosso) che legge `digitalRead(KILLSWITCH_SENSE_PIN)`
+**direttamente**, bypassando interrupt/debounce/state machine. Interrogato
+a polling (4 volte/secondo) per 45s mentre l'utente premeva/rilasciava
+fisicamente il killswitch: il pin è risultato **fisso a LOW per l'intera
+finestra**, e il timestamp dell'ultimo fronte HIGH mai aggiornato dal
+valore di boot — cioè il segnale elettrico non arrivava mai a GPIO39,
+indipendentemente dall'azione fisica sul pulsante. Questo esclude un bug
+nella logica software (interrupt/debounce/`updateKillswitchState()`,
+introdotta nella voce successiva): non c'era nulla su cui quella logica
+potesse reagire. Causa isolata a un problema elettrico/di cablaggio a monte
+di GPIO39 (connettore, pull-up esterno, o contatto meccanico del pulsante
+stesso) — plausibilmente disturbato durante i ripetuti spegni/riaccendi e
+maneggiamenti di cavi fatti proprio per testare quello scenario. Dopo
+verifica/sistemazione della meccanica da parte dell'utente, il
+comportamento è tornato corretto; causa esatta della disconnessione non
+identificata con precisione (va tenuta presente se il sintomo dovesse
+ripresentarsi: rifare lo stesso test con `DEBUG_RAW_KILLSWITCH` se serve
+ridiagnosticare, reintroducendolo temporaneamente).
+
+Nessuna modifica alla logica killswitch è stata necessaria: il codice
+descritto nella voce precedente (sensing, debounce, `position_unverified`,
+gating comandi) si è comportato correttamente per tutta la diagnosi.
+
+### Feature: killswitch integrato in firmware, protocollo e GUI (sensing, stato "posizione non verificata", abort prova, log eventi)
+
+Seguito della voce precedente ("Hardware: ... killswitch — cablati e
+verificati, logica firmware non ancora scritta"): in questa sessione il
+killswitch è stato integrato end-to-end — sensing/debounce firmware,
+gating dei comandi di movimento, protocollo seriale, indicatori GUI e un
+nuovo log eventi di sistema. **Scope esplicitamente escluso da questa
+sessione**: la logica di lettura dei pulsanti manuali fisici e del jog
+encoder (pianificata per una sessione successiva) — dove il killswitch deve
+interagire con quel futuro jog fisico, è stato predisposto il gating
+(`killswitch_engaged`, variabile globale già riusabile) senza scrivere la
+logica di lettura fisica.
+
+**Firmware** (`Controllo-Macchina-ESP32/src/main.cpp`):
+- Sensing su `KILLSWITCH_SENSE_PIN`=GPIO39 tramite interrupt `CHANGE`
+  sempre attivo (indipendente da `motor_state`/`comms_mode`), con debounce
+  **asimmetrico**: pressione (HIGH) rilevata subito nell'ISR, rilascio
+  (LOW) confermato solo dopo ~200ms di stato stabile
+  (`KILLSWITCH_RELEASE_DEBOUNCE_MS`), per non scambiare un rimbalzo
+  meccanico di rilascio per un rilascio vero. Implementato con un solo
+  timestamp (`killswitch_last_high_ms`, aggiornato a ogni fronte HIGH
+  anche durante un rimbalzo) confrontato con `millis()` in
+  `updateKillswitchState()`, chiamata per prima a ogni giro di `loop()`.
+- Nuova variabile di stato `position_unverified`: `true` alla pressione del
+  killswitch, o già `true` dal **boot** se il killswitch risulta premuto
+  all'accensione (letto in `setup()` prima di attaccare l'interrupt — il
+  firmware invia comunque `STATUS:KILLSWITCH_TRIGGERED` in quel caso). Resta
+  `true` durante il rilascio: solo un **HOME completato con successo** la
+  riporta a `false` (impostato alla fine di `HOMING_FINAL_LIFT`, prima di
+  `STATUS:HOMING_COMPLETED`). A un boot pulito (killswitch non premuto)
+  parte `false`, coerentemente con il comportamento preesistente del resto
+  del sistema (l'homing non era già altrimenti imposto a ogni riavvio).
+- Alla pressione (`onKillswitchTriggered()`): stesso path già usato dallo
+  stop di emergenza `!` esistente (`motor_state=STOPPED`,
+  `comms_mode=POLLING`, `stopMotor()`, `target_steps_remaining=0`),
+  applicato qualunque fosse `motor_state` (jog, homing, test monotonico o
+  ciclico). Invia sempre `STATUS:KILLSWITCH_TRIGGERED` e, se un test era in
+  corso, anche `STATUS:TEST_ABORTED;REASON=KILLSWITCH` (nome scelto per
+  coerenza con lo stile esistente a `;CHIAVE=VALORE`, es.
+  `CALIBRATION_INVALIDATED;REASON=GAIN_CHANGED`, invece della forma
+  `TEST_ABORTED:KILLSWITCH` proposta come esempio nella richiesta). Al
+  rilascio confermato: `STATUS:KILLSWITCH_CLEARED`.
+- Comandi bloccati mentre `position_unverified == true` (stato "giallo" se
+  il killswitch non è premuto ORA, "rosso" se lo è): `START_TEST`/
+  `START_CYCLIC_TEST` (→ `STATUS:TEST_START_REJECTED;REASON=POSITION_UNVERIFIED`)
+  e `GOTO` (→ `STATUS:GOTO_REJECTED;REASON=POSITION_UNVERIFIED`). `HOME`
+  resta **sempre permesso** (unico modo per uscirne). `JOG_UP`/`JOG_DOWN`
+  sono gated separatamente su `killswitch_engaged` (non su
+  `position_unverified`): permessi in stato giallo, bloccati solo in stato
+  rosso (→ `STATUS:JOG_REJECTED;REASON=KILLSWITCH_ENGAGED`) — scelta
+  deliberata per riflettere fin da ora la regola richiesta anche per i
+  futuri jog fisici, che dovranno riusare la stessa variabile.
+- Nuovo comando `GET_KILLSWITCH_STATE` → risponde
+  `STATUS:KILLSWITCH_STATE;ENGAGED=0|1;POSITION_UNVERIFIED=0|1`, per
+  permettere alla GUI di allinearsi allo stato reale subito dopo la
+  connessione anche su schede che non resettano all'apertura porta seriale
+  (il reset-on-connect già noto, vedi punto critico 3, copre invece il caso
+  più comune tramite l'invio di boot di `KILLSWITCH_TRIGGERED`).
+
+**Python — protocollo/stato** (`main.py`): `MainWindow` traccia
+`killswitch_engaged`/`position_unverified`, aggiornati dai nuovi messaggi
+`STATUS:` sopra; `GET_KILLSWITCH_STATE` inviato in
+`_send_post_connect_commands()` subito dopo la connessione.
+
+**Python — GUI**:
+- Indicatore a 3 livelli (`KillswitchIndicatorWidget`, verde/giallo/rosso)
+  nella barra superiore di `MainWindow` (fuori da `QStackedWidget`, quindi
+  visibile su ogni schermata) e nei dialoghi `LIMITS`/`Filter Config`
+  (le uniche altre finestre dell'app), registrati/deregistrati in
+  `MainWindow._killswitch_indicators` all'apertura/chiusura per restare
+  aggiornati anche a dialog aperto.
+- Banner persistente (`KillswitchBannerWidget`), in aggiunta al popup e non
+  alternativo: resta visibile finché lo stato non torna verde.
+- Popup non bloccante su `KILLSWITCH_TRIGGERED` (`QMessageBox` con
+  `WindowModality.NonModal` + `.show()` invece di `.exec()`), per non
+  impedire l'uso del resto del software mentre è aperto.
+- Gating controlli movimento: avvio prova e GOTO disabilitati in
+  `MonotonicTestWidget`/`CyclicTestWidget` mentre `position_unverified`;
+  Up/Down (software) disabilitati in questi due widget e in
+  `ManualControlWidget` solo mentre `killswitch_engaged`. Homing,
+  impostazioni, calibrazione, dati salvati e connessione/disconnessione
+  seriale restano sempre utilizzabili, come richiesto. Doppia difesa:
+  oltre alla disabilitazione dei pulsanti, gli handler `on_start_test()`/
+  `toggle_goto()` ricontrollano esplicitamente lo stato (il firmware lo
+  rifiuterebbe comunque).
+- Su `STATUS:TEST_ABORTED;REASON=KILLSWITCH`: `on_stop_test(user_initiated=False,
+  abort_reason="KILLSWITCH")` su qualunque widget di test avesse
+  `is_test_running`, che finalizza/autosalva il provino **mantenendo tutti i
+  dati già raccolti** (nessun troncamento), con nome file
+  `AUTOSAVE_KILLSWITCH_ABORTED_...`/`AUTOSAVE_CYCLIC_KILLSWITCH_ABORTED_...`
+  invece di `AUTOSAVE_...`, e una riga `Test Status: INTERRUPTED —
+  KILLSWITCH` in grassetto/rosso scritta da `DataSaver` nella sezione
+  parametri del foglio Excel (nuovo campo opzionale `abort_reason` sul
+  provino, `None` nel caso normale — non aggiunge nulla al file esistente).
+  Scelta deliberata non esplicitamente richiesta: se il provino monotonico
+  aveva "Return to start" attivo, l'invio automatico di `RETURN_TO_START`
+  viene saltato in questo caso specifico, per non far muovere
+  automaticamente il motore subito dopo un'emergenza prima che l'operatore
+  rifaccia l'homing (in aggiunta al gating firmware descritto subito sotto).
+
+### Fix: `RETURN_TO_START` non era gated da `position_unverified` a livello firmware
+
+Segnalato dall'utente subito dopo la voce precedente: `RETURN_TO_START` usa
+lo stesso meccanismo a passi contati basato su `pulse_count` di `GOTO`
+(stesso `target_steps_remaining`), quindi soffre dello stesso problema se la
+posizione non è verificata (killswitch attivato in precedenza, homing non
+ancora ripetuto) — ma solo `GOTO` aveva la guardia firmware corrispondente;
+`RETURN_TO_START` era mitigato solo lato GUI (skip dell'invio automatico
+dopo un abort da killswitch, vedi voce precedente), quindi restava invocabile
+senza restrizioni se richiamato altrimenti.
+
+Aggiunta in `Controllo-Macchina-ESP32/src/main.cpp` la stessa guardia già
+usata per `GOTO`: `RETURN_TO_START` viene rifiutato
+(`STATUS:GOTO_REJECTED;REASON=POSITION_UNVERIFIED`) mentre
+`position_unverified == true`. Nome del messaggio di rifiuto riusato
+deliberatamente (non un nuovo `RETURN_TO_START_REJECTED`): stessa categoria
+di comando (movimento assoluto a passi contati basato su `pulse_count`),
+stesso motivo di rifiuto — coerente con il precedente già stabilito da
+`TEST_START_REJECTED`, condiviso tra `START_TEST` e `START_CYCLIC_TEST`.
+Verificato con `pio run` (compilazione riuscita, footprint invariato).
+
+**Python — nuovo log eventi di sistema** (`event_logger.py`, nuovo modulo):
+`EventLogger`, log JSON Lines append-only in `event_log.jsonl` (cartella
+dell'app, accanto a `settings.json`), **separato dai dati di misura delle
+prove** (mai forza/spostamento/tempo dei test, solo eventi discreti con
+timestamp). Eventi loggati in questa sessione: `killswitch_triggered`,
+`killswitch_cleared`, `homing_completed`, `test_aborted_killswitch` (con
+provino e tipo test), `serial_connected`/`serial_disconnected`,
+`calibration_invalidated`. Pensato come infrastruttura generale per futuri
+eventi di sistema, non solo per il killswitch.
+
+**Verifica effettuata**: compilazione firmware (`pio run`, successo, RAM
+6.9% / Flash 24.4%). Nessun hardware reale disponibile in questa sessione:
+verificato invece con un banco di test headless lato Python (`QT_QPA_PLATFORM=offscreen`)
+che inietta i pacchetti `STATUS:` direttamente in
+`handle_data_from_esp32()`, coprendo:
+- Trigger/clear/homing da stato **idle**: transizioni verde→rosso→giallo→verde,
+  indicatore, banner, e abilitazione controlli (start/goto disabilitati in
+  giallo e rosso, Up/Down disabilitati solo in rosso) tutte corrette.
+- Trigger **durante un homing attivo** lato GUI: UI di homing resettata
+  correttamente (stesso comportamento già esistente per `STOPPED_BY_USER`),
+  Up/Down restano disabilitati finché il killswitch resta premuto.
+- Trigger **durante una prova monotonica** con dati già accumulati: dopo
+  `TEST_ABORTED;REASON=KILLSWITCH`, `is_test_running` torna `False`, i dati
+  raccolti restano tutti presenti sul provino, `abort_reason="KILLSWITCH"`
+  viene salvato, e viene creato un file con il prefisso atteso — verificato
+  anche il contenuto del foglio Excel risultante (`Test Status: INTERRUPTED
+  — KILLSWITCH` presente e in grassetto).
+- Boot con killswitch già premuto: simulato tramite
+  `STATUS:KILLSWITCH_STATE;ENGAGED=1;POSITION_UNVERIFIED=1` (il percorso che
+  la GUI userebbe realmente su schede che non resettano alla connessione) —
+  stato risultante correttamente rosso con `position_unverified=True`.
+
+Non ancora verificato con la macchina fisica collegata: **prossimo passo
+prima di un uso reale** è testare fisicamente i tre scenari (idle, homing,
+test in corso) premendo il killswitch reale, e confermare a voce/acusticamente
+(come già fatto per la sola verifica hardware) che il motore si ferma
+immediatamente in tutti i casi.
+
+**Compromessi e rischi residui noti** (vedi anche `CLAUDE.md`, sezione
+Killswitch, per il dettaglio):
+1. Lag di rilascio fino a ~200ms (debounce voluto) — nessun impatto sulla
+   sicurezza, solo un ritardo nell'aggiornamento di indicatore/banner.
+2. Un boot pulito (killswitch non premuto) non forza l'homing:
+   `position_unverified` parte `false` come già accadeva implicitamente in
+   tutto il resto del sistema — non introdotto né corretto da questa modifica.
+3. ✅ **[RISOLTO, stessa giornata]** `RETURN_TO_START` non era gated da
+   `position_unverified` a livello firmware — vedi voce successiva in
+   questo changelog per il fix.
+4. Se il killswitch scatta mentre un dialog modale (`LIMITS`/`Filter
+   Config`) è aperto, il popup non modale potrebbe restare dietro o non
+   ricevere subito il focus finché il dialog non viene chiuso — limitazione
+   nota, non risolta in questa sessione.
+
+### Hardware: pulsanti manuali, jog encoder e killswitch — cablati e verificati, logica firmware non ancora scritta
+
+Aggiunto e cablato fisicamente nuovo hardware di controllo/sicurezza
+manuale, verificato con sketch di test standalone isolati (non ancora
+integrati in `main.cpp`): un encoder di jog meccanico con pulsante
+integrato, un killswitch hardware E-stop sulla linea di potenza +48V, e
+verifica fisica dei pulsanti manuali Up/Down già previsti nel firmware.
+Questa voce documenta **solo lo stato hardware verificato**: nessuna riga
+di `main.cpp` è stata modificata in questa sessione — la logica firmware
+che userà questi pin (lettura quadratura del jog encoder, gestione
+pulsante, reazione al killswitch) è pianificata per una sessione
+successiva. Vedi `CLAUDE.md` (sezione "Pinout ESP32") per il riepilogo
+tabellare di tutti i pin, cablati e riservati.
+
+**Pulsanti manuali Up/Down** (`UP_BUTTON_PIN`=18, `DOWN_BUTTON_PIN`=19, pin
+già presenti nel firmware): cablaggio fisico verificato, ciascuno tra il
+proprio GPIO e GND, `INPUT_PULLUP` software, nessun resistore esterno. Pin
+invariati; la funzione firmware che li legge (`handleHardwareInputs()`)
+resta disabilitata/commentata come prima (vedi `docs/firmware_main.md`) —
+non toccata in questa sessione.
+
+**Jog encoder** (nuovo controllo manuale — da non confondere con l'encoder
+esterno di misura spostamento Omron E6B2, già presente su
+`ENCODER_PIN_A/B/Z`): encoder meccanico "nudo" 5 pin con pulsante
+integrato, cablato su `JOG_ENCODER_A`=GPIO13, `JOG_ENCODER_B`=GPIO14
+(comune a GND, entrambi `INPUT_PULLUP`), `JOG_ENCODER_SW`=GPIO25 (pulsante
+tra GPIO e GND, `INPUT_PULLUP`). **Verificato fisicamente con sketch di
+test: il verso di conteggio risulta invertito rispetto alla rotazione
+fisica attesa** — da correggere nel firmware definitivo scambiando A/B
+nella definizione dei pin oppure invertendo il segno dell'incremento nella
+decodifica quadratura (equivalenti, nessun ricablaggio necessario).
+
+**Killswitch** (nuovo sottosistema di sicurezza hardware): interruttore
+E-stop fisico normalmente chiuso (NC), inserito in serie sulla linea di
+potenza +48V a monte del driver motore ISV57T090S — l'apertura taglia
+realmente l'alimentazione del driver, indipendentemente da qualunque logica
+software. Snubber RC (100Ω + 100nF in serie) in parallelo ai contatti
+COM/NC, per assorbire il picco induttivo del motore all'apertura. Stato
+sentito lato logico tramite optoisolatore 4N25 (anodo da +48V lato driver
+via due resistori 2.2kΩ 0.5W in serie, catodo a GND comune, diodo 1N4007 in
+antiparallelo per protezione da inversione di polarità; collettore su
+`KILLSWITCH_SENSE_PIN`=GPIO39 con pull-up 10kΩ esterno verso 3.3V —
+necessario perché GPIO39 è un pin input-only senza pull interni, emettitore
+a GND logico). **Logica di stato verificata fisicamente, verso non
+intuitivo**: GPIO39=LOW è lo stato di riposo (48V presenti, normale),
+GPIO39=HIGH è killswitch premuto (48V realmente tagliati) — confermato non
+solo elettricamente ma anche acusticamente sul motore (il ronzio di
+holding-current cessa quando il killswitch è premuto e riprende al
+rilascio/riarmo).
+
+**Scoperta sulla topologia di massa**, emersa ispezionando il convertitore
+buck 48V→12V che alimenta l'encoder esterno di misura: è **non isolato**
+(induttore singolo, due MOSFET, controller HY1707, nessun trasformatore —
+topologia sincrona non isolata standard). Di conseguenza GND linea potenza
+48V, GND buck 12V, GND encoder esterno e GND logico ESP32 sono tutti la
+stessa rete elettrica: non esiste alcuna barriera di isolamento galvanico
+reale nel sistema attuale. L'optoisolatore 4N25 del killswitch, in questo
+contesto, non fornisce isolamento galvanico (la massa è comunque condivisa
+altrove) — la sua funzione reale è tradurre in sicurezza il livello 48V
+verso 3.3V logico, non isolare elettricamente i due domini. Da tenere
+presente come possibile causa nota se in futuro emergesse
+rumore/instabilità sulle letture di cella di carico o encoder (massa
+condivisa col driver stepper, non necessariamente un difetto software).
+
+**Riservati per lavoro futuro, non ancora cablati fisicamente**: pin scelti
+per un futuro ADC esterno ADS1220 via SPI (`CS`=GPIO5, `SCK`=GPIO21,
+`MOSI`=GPIO26, `MISO`=GPIO36). Nessun GPIO libero adatto rimasto per
+`DRDY`: il piano è leggerlo via polling del registro di status su SPI
+invece che via interrupt hardware.
+
 ## 2026-07-14
 
 ### Fix: il pulsante STOP principale non interrompeva un movimento "Go To"

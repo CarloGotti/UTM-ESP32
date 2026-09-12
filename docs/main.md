@@ -20,7 +20,11 @@ dall'ESP32.
     `current_disp_limit_mm` = 190 mm), la configurazione del filtro cella di
     carico (`current_filter_alpha` / `current_filter_rate_sps` /
     `current_filter_pga_gain`, caricati da `self.settings['filter_config']`),
-    il thread `SerialCommunicator`, tutti i
+    la configurazione ADS1220 (`current_ads1220_sps`/`gain`/`pga_bypass`/
+    `idac_ua`/`window`, caricati da `self.settings['ads1220_config']`) e
+    `active_resistance_source` ("OFF"/"LCR"/"ADS1220", tracciato solo per
+    disabilitare il dialog "ADS1220 Settings" mentre il canale è attivo —
+    vedi sotto), il thread `SerialCommunicator`, tutti i
     widget e tutte le connessioni segnale/slot. Avvia anche il `QTimer` di
     polling a 100 ms (`data_request_timer`, non ancora avviato qui).
   - `on_connected()` / `on_disconnected()`: gestiscono lo stato dei pulsanti di
@@ -31,8 +35,11 @@ dall'ESP32.
     abbia causato un reset hardware dell'ESP32 (comune sulle schede con
     USB-seriale CH340/CP210x). `_send_post_connect_commands()` invia
     `SET_MODE:POLLING`, i limiti di sicurezza correnti
-    (`send_limits_to_firmware()`) e la configurazione del filtro
-    (`send_filter_config_to_firmware()`).
+    (`send_limits_to_firmware()`), la configurazione del filtro
+    (`send_filter_config_to_firmware()`) e la configurazione ADS1220
+    (`send_ads1220_config_to_firmware()` — il firmware la rifiuta se il
+    canale risulta già in polling da una sessione precedente non riavviata,
+    gestito in modo asincrono da `handle_data_from_esp32()`, vedi sotto).
   - `handle_data_from_esp32(data)`: **cuore del dispatch**. Distingue righe
     `STATUS:` da righe `D:`.
     - Per `STATUS:`: interpreta per substring matching (`in`, non `==`) e
@@ -54,19 +61,47 @@ dall'ESP32.
       ferma per una ragione diversa dal click dell'utente sullo stesso
       pulsante Go To (che si ripristina già da solo, otticamente, appena
       cliccato — vedi `docs/monotonic_test_widget.md`).
-    - Per `D:`: fa parsing flessibile a 3/4/5/6 campi (solo 6 usato dal
+    - Per `D:`: fa parsing flessibile a 3/4/5/6/7 campi (solo 7 usato dal
       firmware attuale), converte grammi→N e passi→mm, aggiorna le variabili
       assolute (`absolute_load_N`, `absolute_displacement_mm`,
-      `current_resistance_ohm`) su tutti i widget che le espongono, poi
-      chiama `handle_stream_data()` e `update_displays()` sul widget
-      attualmente visibile. Il 6° campo (opzionale, `None` se assente o non
-      parsabile) è il conteggio grezzo dell'encoder incrementale esterno:
-      viene convertito in `encoder_displacement_mm` con
-      `(encoder_count / ENCODER_COUNTS_PER_REV) * SCREW_PITCH_MM` e
-      propagato come `absolute_encoder_displacement_mm` sui widget, e passato
-      come argomento aggiuntivo a `handle_stream_data()`. **Canale di sola
+      `current_resistance_lcr_ohm`, `current_resistance_ads_ohm`) su tutti i
+      widget che le espongono, poi chiama `handle_stream_data()` e
+      `update_displays()` sul widget attualmente visibile. Il 6° campo
+      (opzionale, `None` se assente o non parsabile) è il conteggio grezzo
+      dell'encoder incrementale esterno: viene convertito in
+      `encoder_displacement_mm` con `(encoder_count /
+      ENCODER_COUNTS_PER_REV) * SCREW_PITCH_MM` e propagato come
+      `absolute_encoder_displacement_mm` sui widget. Il 7° campo (sentinel
+      `-999.0` se assente/canale disattivo) è la resistenza letta
+      dall'ADS1220 (`resistance_ads_ohm`, alternativa al 5° campo
+      `resistance_lcr_ohm`, canale LCR — mai attivi insieme lato GUI, vedi
+      `CLAUDE.md`). `handle_stream_data()` è ora chiamato con **entrambi** i
+      valori grezzi di resistenza (`resistance_lcr_ohm, resistance_ads_ohm`)
+      più l'encoder: è il widget stesso a scegliere quale mostrare/salvare
+      in base al proprio `resistance_source_combo` locale (vedi
+      `docs/manual_control_widget.md` e affini). **Canale encoder di sola
       lettura (Livello 1)**: non entra in nessuna validazione di sicurezza né
-      logica di stop, serve solo per confronto/logging (vedi `CHANGELOG.md`).
+      logica di stop, serve solo per confronto/logging (vedi `CHANGELOG.md`);
+      stesso discorso per entrambi i canali di resistenza.
+    - `"ADS1220_CONFIG_SET"`/`"ADS1220_CONFIG;"` in status_message: allinea
+      `current_ads1220_*` ai valori **realmente applicati** dal firmware
+      (può differire da quanto richiesto per `PGA_BYPASS` se `GAIN>=8`, nel
+      qual caso mostra un popup esplicativo) e li ripersiste in
+      `settings['ads1220_config']`. `"ADS1220_CONFIG_REJECTED"`: popup con
+      il motivo (`POLLING_ACTIVE` o `OUT_OF_RANGE`).
+    - `_on_resistance_source_changed(source)`: slot collegato al segnale
+      `resistance_source_changed` emesso da ciascuno dei tre widget
+      (Manual/Monotonic/Cyclic) quando l'utente cambia il selettore
+      "Sorgente" locale; aggiorna solo `self.active_resistance_source`,
+      usato esclusivamente per decidere se `show_ads1220_dialog()` può
+      aprirsi. **Non sincronizza** il combo delle altre schermate (stessa
+      limitazione preesistente del vecchio checkbox LCR).
+    - `send_ads1220_config_to_firmware()` / `show_ads1220_dialog()`: stesso
+      pattern di `send_filter_config_to_firmware()`/`show_filter_dialog()`,
+      con in più il controllo su `active_resistance_source == "ADS1220"`
+      prima di aprire il dialog (mostra un messaggio esplicativo invece di
+      aprirlo, il firmware rifiuterebbe comunque `SET_ADS1220_CONFIG` col
+      canale attivo).
     - `"CALIBRATION_INVALIDATED" in status_message`: resetta
       `active_calibration_info` a "Not Calibrated" (propagato a
       `manual_control`/`monotonic_test_widget`), chiama
@@ -113,8 +148,10 @@ dall'ESP32.
 
 - Importa e istanzia direttamente: `MainMenuWidget`, `ManualControlWidget`,
   `CalibrationWidget`, `MonotonicTestWidget`, `CyclicTestWidget`,
-  `SerialCommunicator`, `SettingsManager`, `LimitsDialog` e
-  `FilterConfigDialog` (da `custom_widgets.py`).
+  `SerialCommunicator`, `SettingsManager`, `LimitsDialog`,
+  `FilterConfigDialog` e `ADS1220ConfigDialog` (da `custom_widgets.py`).
+  `main_menu.ads1220_button.clicked` è collegato a `show_ads1220_dialog()`,
+  stesso pattern di `filter_button`/`show_filter_dialog()`.
 - `MonotonicTestWidget` e `CyclicTestWidget` ricevono un riferimento a
   `MainWindow` (`self`) e leggono `main_window.current_force_limit_N` /
   `current_disp_limit_mm` per le validazioni sui limiti — quindi `main.py` è
@@ -156,3 +193,12 @@ dall'ESP32.
   `current_force_limit_N`: un cambio di gain invalida la calibrazione della
   cella ma non ha relazione diretta col limite di sicurezza assoluto
   impostato dall'utente, che resta quello che era.
+- **`active_resistance_source` è solo un flag di gating, non uno stato
+  sincronizzato**: riflette l'ultima sorgente scelta su una qualunque delle
+  tre schermate (Manual/Monotonic/Cyclic), usato unicamente per abilitare/
+  disabilitare "ADS1220 Settings" nel menu. Non aggiorna il combo delle
+  altre schermate: se l'utente abilita ADS1220 dalla schermata Manuale e
+  poi apre Monotonic senza toccarne il combo, quest'ultimo mostra ancora
+  "Off" pur essendo il canale realmente attivo a livello firmware — stessa
+  limitazione preesistente del vecchio checkbox LCR (mai stato sincronizzato
+  tra schermate), non introdotta né risolta da questa modifica.

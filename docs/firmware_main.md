@@ -8,8 +8,10 @@
 
 Firmware dell'ESP32 che pilota fisicamente la macchina: motore passo-passo
 (vite senza fine) per il movimento, cella di carico NAU7802 (I2C) per la
-forza, endstop meccanici, e opzionalmente un LCR-meter esterno via UART2.
-Espone
+forza, endstop meccanici, e due canali di resistenza campioni **alternativi**
+(mai attivi insieme): un LCR-meter esterno via UART2, e un ADC ADS1220
+esterno via SPI (misura ratiometrica a 4 fili, vedi sezione dedicata sotto e
+`CLAUDE.md`). Espone
 un protocollo seriale a comandi testuali (vedi `CLAUDE.md`, sezione
 "Protocollo di comunicazione seriale") e implementa da solo tutta la logica
 di temporizzazione, sicurezza e macchine a stati dei test — la GUI Python
@@ -35,11 +37,18 @@ principali sono:
   rispetto a prima), il timer hardware (`stepTimer`) che genera gli
   impulsi di step via interrupt, e l'encoder incrementale esterno (pin
   34/35/27, `attachInterrupt` su tutti e tre in modalità `CHANGE`, vedi
-  sotto).
+  sotto). Inizializza anche l'**ADS1220** (SPI custom via
+  `ads1220SPI.begin(SCLK, MISO, MOSI, CS)`, comando `RESET` via SPI, poi
+  `applyAds1220Config()` con i valori di default — il canale resta comunque
+  disattivo, `ads1220_polling_enabled=false`, finché non arriva
+  `ENABLE_ADS1220_POLLING`; vedi sezione dedicata sotto).
 - **`loop()`**: gestisce il completamento di movimenti a passi contati
   (`move_completed_flag`), poi chiama in sequenza `handleSerialCommands()`,
-  `handleDataStreaming()`, `updateMotorState()`, `updateLCRReading()`.
-  `handleHardwareInputs()` (pulsanti fisici) è **disabilitata** (commentata).
+  `handleDataStreaming()`, `updateMotorState()`, `handleHardwareInputs()`
+  (pulsanti manuali fisici Up/Down, riabilitata in questa sessione — era
+  disabilitata/commentata), `handleJogEncoderMotion()` (movimento a step del
+  jog encoder), `handleJogStepButton()` (pulsante integrato dell'encoder,
+  cambio preset di step), `updateLCRReading()`, `updateADS1220Reading()`.
 - **`onStepTimer()`** (ISR, `IRAM_ATTR`): alterna il pin di step,
   incrementa/decrementa `pulse_count`, e decrementa `target_steps_remaining`
   per i movimenti a conteggio (homing, return-to-start, pre-posizionamento
@@ -75,8 +84,14 @@ principali sono:
   `GET_FILTER_CONFIG` (risponde con la configurazione corrente incluso
   `GAIN`, sullo stesso modello di `GET_SCALE` — vedi Punti di attenzione).
   I comandi con parametri (`START_CYCLIC_TEST`, `EXECUTE_RAMP`,
-  `SET_LIMITS`, `START_TEST`, `SET_FILTER_CONFIG`) fanno parsing manuale
-  con `indexOf`/`substring` (vedi Punti di attenzione).
+  `SET_LIMITS`, `START_TEST`, `SET_FILTER_CONFIG`, `SET_ADS1220_CONFIG`) fanno
+  parsing manuale con `indexOf`/`substring` (vedi Punti di attenzione).
+  `ENABLE_ADS1220_POLLING`/`DISABLE_ADS1220_POLLING` seguono esattamente lo
+  stesso pattern dei comandi LCR equivalenti; `SET_ADS1220_CONFIG` è
+  rifiutato (`STATUS:ADS1220_CONFIG_REJECTED;REASON=POLLING_ACTIVE`) se il
+  canale è già in polling, validato atomicamente come `SET_FILTER_CONFIG`
+  (`REASON=OUT_OF_RANGE` se un campo non è valido, nessuna applicazione
+  parziale) e altrimenti chiama `applyAds1220Config()`.
   `GOTO:<mm>` (posizione assoluta, sola andata, >= 0) è accettato con la
   stessa condizione di `JOG_UP`/`JOG_DOWN`/`HOME`/`SET_SPEED`
   (`!is_hardware_jog_active && motor_state == STOPPED`): converte mm in
@@ -134,7 +149,10 @@ principali sono:
 - **`handleDataStreaming()`**: chiama `readLoadNonBlocking()` e, se
   `comms_mode == STREAMING`, emette un pacchetto `D:` ogni
   `STREAM_INTERVAL_MS` (20 ms → 50 Hz) con il valore di carico già filtrato,
-  incluso il 6° campo (conteggio encoder, vedi sotto).
+  incluso il 6° campo (conteggio encoder) e il 7° campo (resistenza
+  ADS1220, `RES_ADS`, sentinel `-999.0` se il canale non è abilitato — il 5°
+  campo, `RES_LCR`, resta invariato). Lo stesso schema a 7 campi è usato
+  anche nella risposta a `GET_DATA`.
 - **Encoder incrementale esterno** (Omron E6B2-CWZ6C, 1200 PPR, montato
   direttamente sulla vite senza fine): decodifica in quadratura 4x via due
   ISR (`handleEncoderChange()` su A/B, tabella di transizione
@@ -169,6 +187,45 @@ principali sono:
   `Serial2`, poi aspetta la risposta con un timeout doppio
   dell'intervallo di polling) per non bloccare mai il loop principale in
   attesa dell'LCR-meter.
+- **ADS1220 (resistenza campioni via SPI, canale alternativo all'LCR)**:
+  `ads1220WriteReg()`/`ads1220ReadReg()` (WREG/RREG, un registro alla volta),
+  `ads1220ReadData()` (RDATA, legge la conversione corrente e fa
+  sign-extend da 24 a 32 bit — sicuro senza pin `DRDY` dedicato perché il
+  chip resta sempre in **continuous conversion mode**, `CM=1`).
+  `applyAds1220Config()` traduce `ads1220_sps`/`gain`/`pga_bypass`/`idac_ua`
+  nei 4 byte di registro (vedi `CLAUDE.md` per la mappa bit-per-bit) e li
+  scrive via `ads1220WriteReg()`, poi invia `START/SYNC` (obbligatorio dopo
+  una scrittura registri in continuous mode) e azzera il buffer della media
+  mobile; chiamata sia da `ENABLE_ADS1220_POLLING` sia da un
+  `SET_ADS1220_CONFIG` riuscito. `updateADS1220Reading()`, chiamata da
+  `loop()`: se il canale non è abilitato imposta il sentinel `-999.0`;
+  altrimenti interroga via `RDATA` rate-limitata a `1000/ads1220_sps` ms,
+  converte con `R_x = (raw / (2^23 * gain)) * ADS1220_R_REF_OHM` e aggiorna
+  una media mobile circolare (`ads1220_avg_buffer`, finestra
+  `ads1220_window`, max 20). **Range massimo misurabile: `R_ref / gain`**
+  (indipendente da IDAC, verificato su hardware reale — vedi `CLAUDE.md`,
+  sezione ADS1220, e `CHANGELOG.md`): oltre quel valore l'ADC satura a
+  fondo scala positivo (`raw = 2^23-1`) e la formula restituisce sempre lo
+  stesso numero, indistinguibile da un circuito aperto. `DEBUG_ADS1220`
+  (comando diagnostico **temporaneo**, non parte del protocollo definitivo)
+  rilegge i 4 registri via RREG più un campione RDATA immediato, per
+  verificare da terminale che le scritture WREG siano realmente arrivate al
+  chip — usato per diagnosticare il bug di parsing descritto sotto.
+- **Pulsanti manuali Up/Down e jog encoder** (`UP_BUTTON_PIN`/
+  `DOWN_BUTTON_PIN`, `JOG_ENCODER_A`/`B`/`SW` — vedi `CLAUDE.md`, sezione
+  dedicata, per il comportamento completo): `isManualJogAllowed()` è la
+  guardia di attivazione condivisa (`motor_state == STOPPED &&
+  target_steps_remaining == 0 && !killswitch_engaged`), unico punto di
+  verità usato sia da `handleHardwareInputs()` (debounce ~25ms, riusa
+  `startMotor()`/`stopMotor()` esattamente come `JOG_UP`/`JOG_DOWN`
+  seriali) sia da `handleJogEncoderMotion()` (consuma il delta di
+  quadratura accumulato da `handleJogEncoderChange()`, ISR su
+  `JOG_ENCODER_A`/`B`, in un movimento relativo `delta × step_size`,
+  impostando `motor_state = JOG_UP`/`JOG_DOWN` invece del meccanismo a passi
+  contati di `GOTO`, per non perdere il controllo endstop). Il preset di
+  step (3 valori, costanti in testa al file) è ciclato da
+  `handleJogStepButton()` (debounce dedicato ~50ms su `JOG_ENCODER_SW`), che
+  emette anche `STATUS:JOG_STEP_SIZE_SET;MM=..`.
 
 ## Dipendenze
 
@@ -264,6 +321,33 @@ principali sono:
   (vedi sopra): il confronto fra i due canali nei dati salvati ha quindi
   senso a partire dall'ultimo homing (o dall'ultimo riavvio, se più
   recente), non attraverso un riavvio senza homing successivo.
+- **Range di resistenza misurabile dall'ADS1220 limitato da `R_ref/gain`**:
+  con `ADS1220_R_REF_OHM = 989.58`, il massimo teoricamente misurabile è
+  `989.58/gain` Ω (indipendente da `ads1220_idac_ua`), a prescindere dal
+  valore di IDAC scelto. Oltre quella soglia l'ADC satura a fondo scala
+  positivo (`raw = 2^23-1`) e il valore riportato resta bloccato a quel
+  numero — indistinguibile da un ingresso realmente aperto (verificato su
+  hardware reale: rimuovere fisicamente il campione non cambia la lettura
+  se era già satura). Chi sceglie `GAIN`/`IDAC` da GUI deve tenerne conto
+  per il range di resistenza atteso del campione; vedi `CLAUDE.md` per la
+  derivazione e `TODO.md` per un'idea di banco di resistenze di riferimento
+  commutabili per estendere il range dinamicamente.
+- **Bug storico corretto**: `SET_ADS1220_CONFIG` usava
+  `command.substring(20)` per isolare i parametri, ma
+  `"SET_ADS1220_CONFIG:"` è lunga **19** caratteri, non 20 — il primo
+  carattere (`S` di `SPS=`) veniva scartato, `indexOf("SPS=")` falliva
+  sempre e il comando era rifiutato con `REASON=OUT_OF_RANGE`
+  indipendentemente dai valori inviati. Diagnosticato confrontando la
+  richiesta rifiutata con `SET_LIMITS`/`SET_FILTER_CONFIG` (stesso pattern,
+  lunghezze del prefisso diverse) e corretto in `command.substring(19)`.
+  Promemoria per chi aggiunge un nuovo comando con questo pattern: contare i
+  caratteri del prefisso letteralmente, non a occhio.
+- **`DEBUG_ADS1220` è un comando diagnostico temporaneo**, aggiunto per
+  isolare il bug sopra e per verificare la saturazione del range (stesso
+  spirito di `DEBUG_RAW_KILLSWITCH`, già rimosso in passato — vedi
+  `CLAUDE.md`): da valutare se rimuovere a validazione ADS1220 completata,
+  non è documentato nella tabella comandi "ufficiale" di `CLAUDE.md` per lo
+  stesso motivo.
 - **Cambiare il guadagno PGA invalida la calibrazione esistente**: offset
   (`TARE`) e fattore di scala (`CALIBRATE`) sono validi solo al gain con
   cui sono stati determinati, perché i conteggi ADC grezzi per lo stesso

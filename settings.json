@@ -25,5 +25,12 @@
         "alpha": 0.9,
         "rate_sps": 320,
         "gain": 128
+    },
+    "ads1220_config": {
+        "sps": 330,
+        "gain": 16,
+        "pga_bypass": false,
+        "idac_ua": 1500,
+        "window": 10
     }
 }

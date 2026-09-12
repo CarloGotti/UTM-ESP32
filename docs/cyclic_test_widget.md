@@ -25,10 +25,15 @@ della sequenza: il proseguimento ai blocchi successivi è pilotato da
   - Segnali: `back_to_menu_requested`, `limits_button_requested`.
   - Stato: `test_sequence` (lista di blocchi, ognuno un dict con almeno
     `"type"` ∈ `{"cyclic","pause","ramp"}`), `current_block_index`,
-    `specimens`, `current_specimen_name`, `current_test_data` (tuple a 9
+    `specimens`, `current_specimen_name`, `current_test_data` (tuple a 10
     elementi: `time_s, rel_disp, rel_load, abs_disp, abs_load, cycle_count,
-    block_num, resistance_ohm, encoder_disp_mm` — l'ultimo è l'encoder
-    **assoluto**, non relativo), `absolute_encoder_displacement_mm` (canale
+    block_num, resistance_ohm, encoder_disp_mm, resistance_source` —
+    `encoder_disp_mm` è l'encoder **assoluto**, non relativo,
+    `resistance_source` è la sorgente resistenza attiva in maiuscolo,
+    `"OFF"/"LCR"/"ADS1220"`), `current_resistance_ohm` (valore della
+    sorgente selezionata in `resistance_source_combo`),
+    `current_resistance_lcr_ohm`/`current_resistance_ads_ohm` (valori grezzi
+    dei due canali alternativi), `absolute_encoder_displacement_mm` (canale
     dell'encoder incrementale esterno, sola lettura — `None` se il pacchetto
     `D:` non lo include), `encoder_displacement_offset_mm` (zero relativo
     dedicato all'encoder, azzerato insieme a `displacement_offset_mm` da
@@ -69,10 +74,20 @@ della sequenza: il proseguimento ai blocchi successivi è pilotato da
     `AUTOSAVE_CYCLIC_<nome>_<timestamp>.xlsx`, includendo anche
     `test_sequence` come `"test_sequence_setup"` per la descrizione testuale
     nel file Excel.
-  - `handle_stream_data(...)`: aggiorna stato, accoda dati (tupla a 9
-    elementi, incluso il canale encoder esterno in coda), aggiorna la/e
-    curva/e live (una per sorgente X attiva, vedi sotto) e quella di
+  - `handle_stream_data(load_N, disp_mm, time_s, cycle_count,
+    resistance_lcr_ohm, resistance_ads_ohm, encoder_disp_mm=None)`: aggiorna
+    stato (inclusi entrambi i canali di resistenza grezzi, poi risolve
+    `current_resistance_ohm` in base al combo), accoda dati (tupla a 10
+    elementi, canale encoder esterno e sorgente resistenza in coda), aggiorna
+    la/e curva/e live (una per sorgente X attiva, vedi sotto) e quella di
     resistenza.
+  - **Resistenza campioni (LCR/ADS1220, canali alternativi)**:
+    `resistance_source_combo` (`"Off"/"LCR"/"ADS1220"`, sostituisce il
+    vecchio checkbox "Enable LCR Reading"), `_on_resistance_source_changed()`
+    invia la coppia `ENABLE_*`/`DISABLE_*` appropriata ed emette
+    `resistance_source_changed` (letto solo da `MainWindow` per il gating
+    del dialog "ADS1220 Settings") — stessa logica duplicata in
+    `manual_control_widget.py`/`monotonic_test_widget.py`.
   - **Sorgente X del grafico (Motor/Encoder)**: stessa logica di
     `monotonic_test_widget.py` — due checkbox (`x_source_motor_checkbox`,
     `x_source_encoder_checkbox`), visibili solo con `x_axis_combo` su

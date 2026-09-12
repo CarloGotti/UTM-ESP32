@@ -4,7 +4,8 @@
 
 Schermata di controllo manuale della macchina: jog su/giù, homing, azzeramenti
 relativi, grafico live carico/tempo a finestra scorrevole, registrazione
-manuale dei dati su Excel e toggle della lettura LCR. È tipicamente la prima
+manuale dei dati su Excel e selezione della sorgente di resistenza campioni
+(LCR-meter esterno o ADS1220, mai attivi insieme). È tipicamente la prima
 schermata usata dopo la connessione, perché l'homing eseguito qui sblocca
 l'accesso alle schermate di test (`show_monotonic_test`/`show_cyclic_test` in
 `main.py` controllano `manual_control.is_homed`).
@@ -30,8 +31,11 @@ l'accesso alle schermate di test (`show_monotonic_test`/`show_cyclic_test` in
     è visibile, `handle_stream_data` ignora i dati e resetta
     `plot_start_time` a 0.
   - Registrazione: `on_rec_button_clicked()` accende/spegne `is_recording`;
-    mentre attiva, ogni chiamata a `handle_stream_data` accoda una tupla a 7
-    elementi (incluso il canale encoder esterno, sola lettura) in
+    mentre attiva, ogni chiamata a `handle_stream_data` accoda una tupla a 8
+    elementi (`elapsed_time, rel_disp, rel_load, disp_mm, load_N,
+    resistance_ohm, encoder_disp_mm, resistance_source` — gli ultimi due
+    sono il canale encoder esterno assoluto e la sorgente resistenza attiva
+    in maiuscolo, `"OFF"/"LCR"/"ADS1220"`) in
     `recorded_data`. Allo stop, `_save_recorded_data()` costruisce
     un "provino fittizio" (gauge/area = `NaN`) e lo salva con `DataSaver`,
     riusando l'intera infrastruttura di export pensata per i test.
@@ -45,11 +49,29 @@ l'accesso alle schermate di test (`show_monotonic_test`/`show_cyclic_test` in
     `DisplayWidget` ("Relative Enc. Displacement (mm)"), accanto a quello
     assoluto già esistente; entrambi mostrano "N/A" finché non arriva un
     pacchetto `D:` a 6 campi.
-  - Resistenza LCR: `_on_lcr_checkbox_changed()` invia
-    `ENABLE_LCR_POLLING`/`DISABLE_LCR_POLLING`; `_setup_resistance_axis()`
+  - **Resistenza campioni (LCR/ADS1220, canali alternativi)**:
+    `resistance_source_combo` (`"Off"/"LCR"/"ADS1220"`, sostituisce il
+    vecchio checkbox "Enable LCR Reading") — `_on_resistance_source_changed()`
+    invia sempre una coppia `ENABLE_*`/`DISABLE_*` (mai entrambi i canali
+    abilitati insieme), azzera i valori grezzi noti
+    (`current_resistance_lcr_ohm`/`current_resistance_ads_ohm`) ed emette il
+    segnale `resistance_source_changed` (letto da `MainWindow` solo per il
+    gating del dialog "ADS1220 Settings", vedi `docs/main.md`).
+    `_current_active_resistance_ohm()` sceglie quale dei due valori grezzi
+    mostrare/salvare in base al combo corrente; `current_resistance_ohm` è
+    quindi il valore della sorgente **attualmente selezionata su questa
+    schermata**, non un terzo canale indipendente. `_setup_resistance_axis()`
     crea/distrugge dinamicamente l'asse Y secondario (stessa logica,
     duplicata, presente in `monotonic_test_widget.py` e
-    `cyclic_test_widget.py`).
+    `cyclic_test_widget.py`), gated su `resistance_source_combo.currentText()
+    != "Off"` invece che sullo stato del vecchio checkbox.
+  - **Jog encoder fisico (a bordo macchina)**: `set_jog_step_size()`
+    aggiorna il `DisplayWidget` "Jog Encoder Step (mm)" su
+    `STATUS:JOG_STEP_SIZE_SET` — puro display informativo, nessuna azione
+    GUI. Pulsanti manuali fisici (Up/Down) e jog encoder sono gestiti
+    interamente dal firmware (vedi `CLAUDE.md`, sezione dedicata): questo
+    widget non invia né riceve alcun comando per il loro funzionamento di
+    base, funzionano anche a GUI chiusa/PC scollegato.
 
 ## Dipendenze
 

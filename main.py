@@ -1,17 +1,18 @@
 import sys
-from PyQt6.QtWidgets import (QApplication, QMainWindow, QStackedWidget, QComboBox, 
-                             QPushButton, QHBoxLayout, QWidget, QStatusBar, QLabel, 
+from PyQt6.QtWidgets import (QApplication, QMainWindow, QStackedWidget, QComboBox,
+                             QPushButton, QHBoxLayout, QWidget, QStatusBar, QLabel,
                              QVBoxLayout, QListWidgetItem, QMessageBox)
-from PyQt6.QtCore import QThread, QTimer, pyqtSignal
+from PyQt6.QtCore import QThread, QTimer, Qt, pyqtSignal
 
 from main_menu_widget import MainMenuWidget
 from manual_control_widget import ManualControlWidget
 from calibration_widget import CalibrationWidget
 from monotonic_test_widget import MonotonicTestWidget
 from cyclic_test_widget import CyclicTestWidget
-from communication import SerialCommunicator 
+from communication import SerialCommunicator
 from settings_manager import SettingsManager
-from custom_widgets import LimitsDialog, FilterConfigDialog
+from custom_widgets import LimitsDialog, FilterConfigDialog, ADS1220ConfigDialog, KillswitchIndicatorWidget, KillswitchBannerWidget
+from event_logger import EventLogger
 
 
 class MainWindow(QMainWindow):
@@ -32,6 +33,14 @@ class MainWindow(QMainWindow):
         self.active_cell_name = None # NUOVA VARIABILE
         self.is_critical_popup_active = False # <-- NUOVA BANDIERINA
 
+        # --- STATO KILLSWITCH (vedi CLAUDE.md per protocollo/hardware) ---
+        self.killswitch_engaged = False    # True = killswitch premuto ORA (stato "rosso")
+        self.position_unverified = False   # True finché non completa un HOME dopo un trigger (stato "giallo" se non rosso)
+        self.event_logger = EventLogger()
+        # Indicatori a 3 livelli attualmente "vivi": la finestra principale
+        # sempre, più quelli dei dialoghi LIMITS/Filter Config finché aperti.
+        self._killswitch_indicators = []
+
         self.PULSES_PER_REV = 2000.0; self.GEAR_RATIO = 10.0; self.SCREW_PITCH_MM = 5.0873
         self.PULSES_TO_MM = self.SCREW_PITCH_MM / (self.PULSES_PER_REV * self.GEAR_RATIO)
         # Encoder incrementale esterno (Omron E6B2-CWZ6C, 1200 PPR x4 = 4800
@@ -47,6 +56,19 @@ class MainWindow(QMainWindow):
         self.current_filter_rate_sps = self.settings['filter_config']['rate_sps']
         self.current_filter_pga_gain = self.settings['filter_config']['gain']
 
+        # --- ADS1220 (resistenza campioni, canale alternativo all'LCR-meter) ---
+        ads_cfg = self.settings['ads1220_config']
+        self.current_ads1220_sps = ads_cfg['sps']
+        self.current_ads1220_gain = ads_cfg['gain']
+        self.current_ads1220_pga_bypass = ads_cfg['pga_bypass']
+        self.current_ads1220_idac_ua = ads_cfg['idac_ua']
+        self.current_ads1220_window = ads_cfg['window']
+        # Sorgente resistenza attualmente attiva a livello firmware ("OFF"/"LCR"/"ADS1220"):
+        # tracciata centralmente (aggiornata dal segnale emesso da qualunque widget quando
+        # l'utente cambia selettore) per poter disabilitare il dialog impostazioni ADS1220
+        # mentre il canale è in polling, indipendentemente da quale schermata è visibile.
+        self.active_resistance_source = "OFF"
+
         self.comm_thread = QThread(); self.communicator = SerialCommunicator()
         self.communicator.moveToThread(self.comm_thread)
         self.comm_thread.started.connect(self.communicator.run); self.comm_thread.start()
@@ -61,9 +83,19 @@ class MainWindow(QMainWindow):
         
         connection_bar.addWidget(QLabel("Porta COM:")); connection_bar.addWidget(self.port_selector)
         connection_bar.addWidget(self.refresh_ports_button); connection_bar.addStretch(1)
+        # Indicatore a 3 livelli del killswitch: nella barra superiore, fuori
+        # dallo QStackedWidget, quindi visibile in ogni schermata dell'app.
+        self.killswitch_indicator = KillswitchIndicatorWidget()
+        self._killswitch_indicators.append(self.killswitch_indicator)
+        connection_bar.addWidget(self.killswitch_indicator)
         connection_bar.addWidget(self.connect_button); connection_bar.addWidget(self.disconnect_button)
 
-        main_layout.addLayout(connection_bar); main_layout.addWidget(self.stacked_widget)
+        main_layout.addLayout(connection_bar)
+        # Banner persistente (in aggiunta al popup, non alternativo): resta
+        # visibile finché lo stato non torna verde, su ogni schermata.
+        self.killswitch_banner = KillswitchBannerWidget()
+        main_layout.addWidget(self.killswitch_banner)
+        main_layout.addWidget(self.stacked_widget)
         self.setCentralWidget(main_widget)
         self.setStatusBar(QStatusBar(self)); self.statusBar().showMessage("Disconnesso.")
 
@@ -79,8 +111,16 @@ class MainWindow(QMainWindow):
         self.main_menu.manual_button.clicked.connect(self.show_manual_control)
         self.main_menu.calibrate_button.clicked.connect(self.show_calibration)
         self.main_menu.filter_button.clicked.connect(self.show_filter_dialog)
+        self.main_menu.ads1220_button.clicked.connect(self.show_ads1220_dialog)
         self.main_menu.monotonic_button.clicked.connect(self.show_monotonic_test)
         self.main_menu.cyclic_button.clicked.connect(self.show_cyclic_test)
+
+        # Sorgente resistenza: qualunque schermata la cambi, MainWindow tiene
+        # traccia dello stato globale (serve solo per gating del dialog
+        # impostazioni ADS1220, vedi self.active_resistance_source sopra).
+        self.manual_control.resistance_source_changed.connect(self._on_resistance_source_changed)
+        self.monotonic_test_widget.resistance_source_changed.connect(self._on_resistance_source_changed)
+        self.cyclic_test.resistance_source_changed.connect(self._on_resistance_source_changed)
         
         self.manual_control.back_to_menu_requested.connect(self.show_main_menu)
         self.calibration_widget.back_to_menu_requested.connect(self.show_main_menu)
@@ -136,6 +176,7 @@ class MainWindow(QMainWindow):
         self.connect_button.setEnabled(False); self.disconnect_button.setEnabled(True)
         self.refresh_ports_button.setEnabled(False); self.port_selector.setEnabled(False)
         self.statusBar().showMessage(f"Connesso a {self.port_selector.currentText()}")
+        self._log_event("serial_connected", {"port": self.port_selector.currentText()})
         # Aprire la porta seriale può causare un reset hardware dell'ESP32 (comune
         # sulle schede con USB-seriale CH340/CP210x): ritardiamo l'invio dei comandi
         # iniziali per dargli il tempo di completare il boot, altrimenti vengono persi.
@@ -146,12 +187,20 @@ class MainWindow(QMainWindow):
         self.communicator.send_command("SET_MODE:POLLING")
         self.send_limits_to_firmware()
         self.send_filter_config_to_firmware()
+        self.send_ads1220_config_to_firmware()
+        # Allinea subito l'indicatore killswitch allo stato reale del
+        # firmware: copre sia il caso "reset su apertura porta" (il boot
+        # invia già KILLSWITCH_TRIGGERED da solo, vedi CLAUDE.md) sia schede
+        # che non resettano alla connessione, dove altrimenti l'indicatore
+        # resterebbe "verde" per errore fino alla prossima transizione fisica.
+        self.communicator.send_command("GET_KILLSWITCH_STATE")
 
     def on_disconnected(self):
         self.data_request_timer.stop()
         self.connect_button.setEnabled(True); self.disconnect_button.setEnabled(False)
         self.refresh_ports_button.setEnabled(True); self.port_selector.setEnabled(True)
         self.statusBar().showMessage("Disconnesso.")
+        self._log_event("serial_disconnected")
 
     # File: main.py
     # SOSTITUISCI completamente la vecchia funzione handle_data_from_esp32 con questa
@@ -167,7 +216,54 @@ class MainWindow(QMainWindow):
             # Gestione specifica dei messaggi di stato
             widget = self.cyclic_test # Riferimento al widget ciclico (usato sotto)
 
-            if "CYCLIC_TEST_STARTED" in status_message or "CYCLIC_PREPOSITIONING" in status_message:
+            # --- KILLSWITCH: gestione stato (priorità alta, valutata per prima) ---
+            if "KILLSWITCH_TRIGGERED" in status_message:
+                self.killswitch_engaged = True
+                self.position_unverified = True
+                self._update_killswitch_indicator()
+                self._log_event("killswitch_triggered")
+                self._show_killswitch_popup()
+                # Un homing eventualmente in corso viene interrotto dallo
+                # stesso path dello stop di emergenza: ripristina la UI di
+                # homing esattamente come già avviene per STOPPED_BY_USER.
+                if self.manual_control.is_homing_active:
+                    self.manual_control.reset_homing_ui()
+
+            elif "KILLSWITCH_CLEARED" in status_message:
+                self.killswitch_engaged = False
+                # position_unverified resta invariato (True): serve un HOME
+                # riuscito per tornare verde, gestito nel ramo HOMING_COMPLETED.
+                self._update_killswitch_indicator()
+                self._log_event("killswitch_cleared")
+
+            elif "KILLSWITCH_STATE" in status_message:
+                # Risposta a GET_KILLSWITCH_STATE (inviato subito dopo la
+                # connessione): allinea lo stato GUI a quello reale del
+                # firmware anche se non è arrivato nessun KILLSWITCH_TRIGGERED
+                # di boot (schede che non resettano all'apertura porta).
+                try:
+                    fields = dict(kv.split("=") for kv in status_message.split(";")[1:])
+                    self.killswitch_engaged = (fields.get("ENGAGED") == "1")
+                    self.position_unverified = (fields.get("POSITION_UNVERIFIED") == "1")
+                    self._update_killswitch_indicator()
+                except (ValueError, IndexError) as e:
+                    print(f"Attenzione: impossibile interpretare KILLSWITCH_STATE da '{status_message}': {e}")
+
+            # Prova interrotta dal killswitch: chiudi il file mantenendo tutti
+            # i dati già acquisiti, marcandolo come interrotto (non completato
+            # né stoppato dall'utente). Distinto da TEST_STOPPED_BY_USER/
+            # CYCLIC_TEST_STOPPED_BY_USER proprio per questo.
+            elif "TEST_ABORTED" in status_message and "KILLSWITCH" in status_message:
+                if self.monotonic_test_widget.is_test_running:
+                    self.monotonic_test_widget.on_stop_test(user_initiated=False, abort_reason="KILLSWITCH")
+                    self._log_event("test_aborted_killswitch", {"test_type": "monotonic",
+                                                                 "specimen": self.monotonic_test_widget.current_specimen_name})
+                if self.cyclic_test.is_test_running:
+                    self.cyclic_test.on_stop_test(user_initiated=False, abort_reason="KILLSWITCH")
+                    self._log_event("test_aborted_killswitch", {"test_type": "cyclic",
+                                                                 "specimen": self.cyclic_test.current_specimen_name})
+
+            elif "CYCLIC_TEST_STARTED" in status_message or "CYCLIC_PREPOSITIONING" in status_message:
                 pass # UI già aggiornata da on_start_test
 
             elif "BLOCK_COMPLETED" in status_message:
@@ -294,6 +390,7 @@ class MainWindow(QMainWindow):
                 self.manual_control.set_calibration_status(self.active_calibration_info)
                 self.monotonic_test_widget.set_calibration_status(self.active_calibration_info)
                 self.calibration_widget.invalidate_calibration()
+                self._log_event("calibration_invalidated", {"reason": status_message})
                 QMessageBox.warning(self, "Ricalibrazione Necessaria",
                                     f"Il firmware ha invalidato la calibrazione corrente "
                                     f"({status_message}).\n\n"
@@ -316,23 +413,80 @@ class MainWindow(QMainWindow):
                 self.cyclic_test.set_homing_status(True)
                 self.manual_control.reset_homing_ui()
                 self.manual_control.update_displays() # Aggiorna subito i display
+                # Un HOME riuscito è l'unico modo per uscire da "posizione non
+                # verificata" (killswitch attivato in passato, o già premuto al boot).
+                if self.position_unverified:
+                    self.position_unverified = False
+                    self._update_killswitch_indicator()
+                    self._log_event("homing_completed")
 
             # Gestione Homing Interrotto
             elif "STOPPED_BY_USER" in status_message and self.manual_control.is_homing_active:
                 self.manual_control.reset_homing_ui()
 
+            # Gestione risposta a SET_ADS1220_CONFIG / GET_ADS1220_CONFIG: il
+            # firmware riporta i valori REALMENTE applicati (non necessariamente
+            # quelli richiesti — es. PGA_BYPASS viene ignorato se guadagno>=8x,
+            # vedi CLAUDE.md), quindi allineiamo sempre lo stato GUI a questi.
+            elif "ADS1220_CONFIG_SET" in status_message or "ADS1220_CONFIG;" in status_message:
+                try:
+                    fields = dict(kv.split("=") for kv in status_message.split(";")[1:])
+                    new_sps = int(fields["SPS"])
+                    new_gain = int(fields["GAIN"])
+                    new_bypass_applied = (fields["PGA_BYPASS"] == "1")
+                    new_idac = int(fields["IDAC"])
+                    new_window = int(fields["WINDOW"])
+                    bypass_was_ignored = (self.current_ads1220_pga_bypass and not new_bypass_applied
+                                           and "ADS1220_CONFIG_SET" in status_message)
+                    self.current_ads1220_sps = new_sps
+                    self.current_ads1220_gain = new_gain
+                    self.current_ads1220_pga_bypass = new_bypass_applied
+                    self.current_ads1220_idac_ua = new_idac
+                    self.current_ads1220_window = new_window
+                    self.settings['ads1220_config'] = {
+                        "sps": new_sps, "gain": new_gain, "pga_bypass": new_bypass_applied,
+                        "idac_ua": new_idac, "window": new_window
+                    }
+                    self.settings_manager.save_settings(self.settings)
+                    if bypass_was_ignored:
+                        QMessageBox.information(self, "Bypass PGA Ignorato",
+                                                 f"Il firmware ha ignorato la richiesta di bypass PGA perché "
+                                                 f"il guadagno selezionato ({new_gain}x) è >= 8x: il PGA resta "
+                                                 f"sempre attivo in questo caso (vincolo del datasheet ADS1220).")
+                except (ValueError, IndexError, KeyError) as e:
+                    print(f"Attenzione: impossibile interpretare {status_message}: {e}")
+
+            elif "ADS1220_CONFIG_REJECTED" in status_message:
+                if "POLLING_ACTIVE" in status_message:
+                    QMessageBox.warning(self, "Configurazione ADS1220 Rifiutata",
+                                        "Il firmware ha rifiutato la nuova configurazione ADS1220 perché "
+                                        "il canale è attualmente in polling: disattivarlo prima di modificarla.")
+                else:
+                    QMessageBox.warning(self, "Configurazione ADS1220 Rifiutata",
+                                        f"Il firmware ha rifiutato la nuova configurazione ADS1220 ({status_message}).")
+
+            # Notifica cambio preset di step del jog encoder fisico (pulsante
+            # integrato GPIO25): puramente informativo, solo per aggiornare
+            # il display corrispondente in ManualControlWidget.
+            elif "JOG_STEP_SIZE_SET" in status_message:
+                try:
+                    step_mm = float(status_message.split("MM=")[1])
+                    self.manual_control.set_jog_step_size(step_mm)
+                except (IndexError, ValueError):
+                    print(f"Attenzione: impossibile interpretare JOG_STEP_SIZE_SET da '{status_message}'")
+
             # Altri messaggi di stato (es. TARE_DONE, CALIBRATION_DONE, etc.)
             # Vengono mostrati nella status bar ma non richiedono azioni specifiche qui.
 
             # Qualunque messaggio che indica che il motore si è comunque
-            # fermato (fine movimento "Go To", endstop, limite di sicurezza)
-            # chiude lo stato "Go To in corso" sui widget di test, se non
-            # l'ha già fatto l'utente cliccando lui stesso il pulsante
+            # fermato (fine movimento "Go To", endstop, limite di sicurezza,
+            # killswitch) chiude lo stato "Go To in corso" sui widget di test,
+            # se non l'ha già fatto l'utente cliccando lui stesso il pulsante
             # (che ora funge da STOP). Non è un elif: deve scattare in
             # aggiunta alla gestione specifica già eseguita sopra per questi
-            # stessi messaggi (es. LIMIT_HIT, TOP_HIT/BOTTOM_HIT).
+            # stessi messaggi (es. LIMIT_HIT, TOP_HIT/BOTTOM_HIT, KILLSWITCH_TRIGGERED).
             if any(code in status_message for code in
-                   ("MOVE_COMPLETED", "STOPPED_BY_USER", "TOP_HIT", "BOTTOM_HIT", "LIMIT_HIT")):
+                   ("MOVE_COMPLETED", "STOPPED_BY_USER", "TOP_HIT", "BOTTOM_HIT", "LIMIT_HIT", "KILLSWITCH_TRIGGERED")):
                 self.monotonic_test_widget.clear_goto_busy_state()
                 self.cyclic_test.clear_goto_busy_state()
 
@@ -350,32 +504,42 @@ class MainWindow(QMainWindow):
                 displacement_mm = None
                 time_s = 0.0
                 cycle_count = 0
-                resistance_ohm = -999.0 # Valore default/fallback
+                resistance_lcr_ohm = -999.0 # Valore default/fallback (canale LCR-meter)
+                resistance_ads_ohm = -999.0 # Valore default/fallback (canale ADS1220)
                 encoder_count = None # Assente sui pacchetti storici (< 6 campi)
 
                 # Parsing flessibile in base alla lunghezza
-                if len(parts) == 6: # Formato con encoder esterno (Livello 1)
-                    load_str, disp_str, time_ms_str, cycle_str, res_str, enc_str = parts
+                if len(parts) == 7: # Formato con ADS1220 (RES_ADS), oltre a LCR ed encoder
+                    load_str, disp_str, time_ms_str, cycle_str, res_lcr_str, enc_str, res_ads_str = parts
                     cycle_count = int(cycle_str)
-                    try: resistance_ohm = float(res_str)
-                    except ValueError: resistance_ohm = -2.0 # Errore parsing resistenza
+                    try: resistance_lcr_ohm = float(res_lcr_str)
+                    except ValueError: resistance_lcr_ohm = -2.0 # Errore parsing resistenza
+                    try: encoder_count = int(enc_str)
+                    except ValueError: encoder_count = None # Errore parsing encoder, tratta come assente
+                    try: resistance_ads_ohm = float(res_ads_str)
+                    except ValueError: resistance_ads_ohm = -2.0
+                elif len(parts) == 6: # Formato con encoder esterno (Livello 1), senza ADS1220 (storico)
+                    load_str, disp_str, time_ms_str, cycle_str, res_lcr_str, enc_str = parts
+                    cycle_count = int(cycle_str)
+                    try: resistance_lcr_ohm = float(res_lcr_str)
+                    except ValueError: resistance_lcr_ohm = -2.0 # Errore parsing resistenza
                     try: encoder_count = int(enc_str)
                     except ValueError: encoder_count = None # Errore parsing encoder, tratta come assente
                 elif len(parts) == 5: # Formato con LCR, senza encoder (storico)
-                    load_str, disp_str, time_ms_str, cycle_str, res_str = parts
+                    load_str, disp_str, time_ms_str, cycle_str, res_lcr_str = parts
                     cycle_count = int(cycle_str)
-                    try: resistance_ohm = float(res_str)
-                    except ValueError: resistance_ohm = -2.0 # Errore parsing resistenza
+                    try: resistance_lcr_ohm = float(res_lcr_str)
+                    except ValueError: resistance_lcr_ohm = -2.0 # Errore parsing resistenza
                 elif len(parts) == 4: # Vecchio formato streaming
                     load_str, disp_str, time_ms_str, cycle_str = parts
                     cycle_count = int(cycle_str)
-                    # resistance_ohm rimane -999.0
+                    # resistance_lcr_ohm/resistance_ads_ohm rimangono -999.0
                 elif len(parts) == 3: # Formato Polling
                     load_str, disp_str, time_ms_str = parts
                     cycle_count = 0
-                    # resistance_ohm rimane -999.0
+                    # resistance_lcr_ohm/resistance_ads_ohm rimangono -999.0
                 else:
-                    raise ValueError(f"Pacchetto D: attesi 3, 4, 5 o 6 valori, ricevuti {len(parts)}")
+                    raise ValueError(f"Pacchetto D: attesi 3, 4, 5, 6 o 7 valori, ricevuti {len(parts)}")
 
                 # Parsing comune
                 load_grams = float(load_str)
@@ -400,8 +564,13 @@ class MainWindow(QMainWindow):
                          widget.absolute_load_N = load_N
                     if hasattr(widget, 'absolute_displacement_mm'):
                          widget.absolute_displacement_mm = displacement_mm
-                    if hasattr(widget, 'current_resistance_ohm'):
-                        widget.current_resistance_ohm = resistance_ohm
+                    # Valori grezzi di entrambi i canali di resistenza (LCR ed ADS1220):
+                    # ciascun widget sceglie da sé quale mostrare/salvare in base al
+                    # proprio selettore locale "Sorgente" (vedi resistance_source_combo).
+                    if hasattr(widget, 'current_resistance_lcr_ohm'):
+                        widget.current_resistance_lcr_ohm = resistance_lcr_ohm
+                    if hasattr(widget, 'current_resistance_ads_ohm'):
+                        widget.current_resistance_ads_ohm = resistance_ads_ohm
                     if hasattr(widget, 'absolute_encoder_displacement_mm'):
                         widget.absolute_encoder_displacement_mm = encoder_displacement_mm
 
@@ -411,7 +580,8 @@ class MainWindow(QMainWindow):
 
                 # Chiama handle_stream_data del widget corrente (se esiste)
                 if hasattr(current_widget, 'handle_stream_data'):
-                    current_widget.handle_stream_data(load_N, displacement_mm, time_s, cycle_count, resistance_ohm, encoder_displacement_mm)
+                    current_widget.handle_stream_data(load_N, displacement_mm, time_s, cycle_count,
+                                                        resistance_lcr_ohm, resistance_ads_ohm, encoder_displacement_mm)
 
                 # Aggiorna i display del widget corrente (se esiste)
                 if hasattr(current_widget, 'update_displays'):
@@ -506,6 +676,58 @@ class MainWindow(QMainWindow):
 
         QTimer.singleShot(10, perform_limit_hit_actions)
 
+    # --- KILLSWITCH: stato, indicatori, popup, log eventi ---
+    def _log_event(self, event_type, details=None):
+        """ Log di sistema persistente (event_log.jsonl), separato dai dati di
+        misura delle prove: vedi event_logger.py. """
+        self.event_logger.log(event_type, details)
+
+    def _killswitch_visual_state(self):
+        if self.killswitch_engaged:
+            return "red"
+        if self.position_unverified:
+            return "yellow"
+        return "green"
+
+    def _update_killswitch_indicator(self):
+        """ Propaga lo stato corrente del killswitch a: indicatori a 3 livelli
+        (finestra principale + eventuali dialoghi LIMITS/Filter Config
+        attualmente aperti), banner persistente, e ai widget che devono
+        abilitare/disabilitare controlli di movimento in base allo stato. """
+        state = self._killswitch_visual_state()
+        for indicator in self._killswitch_indicators:
+            indicator.set_state(state)
+
+        if state == "red":
+            self.killswitch_banner.set_state(
+                "red", "KILLSWITCH ATTIVATO — motore arrestato. Rilasciare il killswitch per continuare.")
+        elif state == "yellow":
+            self.killswitch_banner.set_state(
+                "yellow", "Posizione non verificata — eseguire HOMING prima di avviare una prova o un GOTO.")
+        else:
+            self.killswitch_banner.set_state("green")
+
+        self.manual_control.set_killswitch_state(self.killswitch_engaged, self.position_unverified)
+        self.monotonic_test_widget.set_killswitch_state(self.killswitch_engaged, self.position_unverified)
+        self.cyclic_test.set_killswitch_state(self.killswitch_engaged, self.position_unverified)
+
+    def _show_killswitch_popup(self):
+        """ Popup NON bloccante: un avviso con pulsante di conferma che non
+        impedisce di continuare a usare il resto del software mentre è aperto
+        (a differenza di QMessageBox.exec(), qui si usa .show() con modalità
+        non modale). """
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Critical)
+        box.setWindowTitle("Killswitch Attivato")
+        box.setText("Il killswitch di emergenza è stato attivato.\n\n"
+                    "Il motore è stato arrestato immediatamente. Rilasciare il killswitch "
+                    "ed eseguire nuovamente l'HOMING prima di avviare una prova o un GOTO.")
+        box.setStandardButtons(QMessageBox.StandardButton.Ok)
+        box.setWindowModality(Qt.WindowModality.NonModal)
+        box.setModal(False)
+        box.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+        box.show()
+
     def send_limits_to_firmware(self):
         """
         Costruisce e invia al firmware il comando SET_LIMITS usando i limiti
@@ -520,22 +742,30 @@ class MainWindow(QMainWindow):
         Mostra la finestra di dialogo per impostare i limiti e invia il comando al firmware.
         """
         dialog = LimitsDialog(self.current_force_limit_N, self.current_disp_limit_mm, self)
-        
-        # Esegui la finestra di dialogo. Se l'utente preme "Save"...
-        if dialog.exec():
-            # Ottieni i valori inseriti dall'utente
-            new_force_N, new_disp_mm = dialog.get_values()
-            self.current_force_limit_N = new_force_N
-            self.current_disp_limit_mm = new_disp_mm
+        # Registra l'indicatore killswitch del dialog: resta una finestra
+        # separata dalla principale, quindi deve riflettere live lo stato
+        # (il dialog è modale, ma il thread seriale continua a emettere
+        # segnali che vengono processati dal loop eventi durante l'exec()).
+        dialog.killswitch_indicator.set_state(self._killswitch_visual_state())
+        self._killswitch_indicators.append(dialog.killswitch_indicator)
+        try:
+            # Esegui la finestra di dialogo. Se l'utente preme "Save"...
+            if dialog.exec():
+                # Ottieni i valori inseriti dall'utente
+                new_force_N, new_disp_mm = dialog.get_values()
+                self.current_force_limit_N = new_force_N
+                self.current_disp_limit_mm = new_disp_mm
 
-            # Costruisci e invia il comando al firmware (logica condivisa)
-            self.send_limits_to_firmware()
-            
-            # Messaggio di conferma per l'utente
-            QMessageBox.information(self, "Limiti Impostati",
-                                    f"Nuovi limiti macchina inviati:\n"
-                                    f"- Forza Massima: {new_force_N:.3f} N\n"
-                                    f"- Spostamento Massimo: {new_disp_mm:.4f} mm")
+                # Costruisci e invia il comando al firmware (logica condivisa)
+                self.send_limits_to_firmware()
+
+                # Messaggio di conferma per l'utente
+                QMessageBox.information(self, "Limiti Impostati",
+                                        f"Nuovi limiti macchina inviati:\n"
+                                        f"- Forza Massima: {new_force_N:.3f} N\n"
+                                        f"- Spostamento Massimo: {new_disp_mm:.4f} mm")
+        finally:
+            self._killswitch_indicators.remove(dialog.killswitch_indicator)
 
     def send_filter_config_to_firmware(self):
         """
@@ -554,19 +784,85 @@ class MainWindow(QMainWindow):
         """
         dialog = FilterConfigDialog(self.current_filter_alpha, self.current_filter_rate_sps,
                                      self.current_filter_pga_gain, self)
-        if dialog.exec():
-            new_alpha, new_rate_sps, new_gain = dialog.get_values()
-            self.current_filter_alpha = new_alpha
-            self.current_filter_rate_sps = new_rate_sps
-            self.current_filter_pga_gain = new_gain
-            self.settings['filter_config'] = {"alpha": new_alpha, "rate_sps": new_rate_sps, "gain": new_gain}
-            self.settings_manager.save_settings(self.settings)
-            self.send_filter_config_to_firmware()
-            QMessageBox.information(self, "Filtro Configurato",
-                                    f"Nuova configurazione filtro inviata:\n"
-                                    f"- Alpha: {new_alpha:.2f}\n"
-                                    f"- Sample Rate: {new_rate_sps} SPS\n"
-                                    f"- Guadagno PGA: {new_gain}x")
+        dialog.killswitch_indicator.set_state(self._killswitch_visual_state())
+        self._killswitch_indicators.append(dialog.killswitch_indicator)
+        try:
+            if dialog.exec():
+                new_alpha, new_rate_sps, new_gain = dialog.get_values()
+                self.current_filter_alpha = new_alpha
+                self.current_filter_rate_sps = new_rate_sps
+                self.current_filter_pga_gain = new_gain
+                self.settings['filter_config'] = {"alpha": new_alpha, "rate_sps": new_rate_sps, "gain": new_gain}
+                self.settings_manager.save_settings(self.settings)
+                self.send_filter_config_to_firmware()
+                QMessageBox.information(self, "Filtro Configurato",
+                                        f"Nuova configurazione filtro inviata:\n"
+                                        f"- Alpha: {new_alpha:.2f}\n"
+                                        f"- Sample Rate: {new_rate_sps} SPS\n"
+                                        f"- Guadagno PGA: {new_gain}x")
+        finally:
+            self._killswitch_indicators.remove(dialog.killswitch_indicator)
+
+    # --- ADS1220 (resistenza campioni) ---
+    def _on_resistance_source_changed(self, source):
+        """ Chiamato dal segnale resistance_source_changed di qualunque widget
+        (Manual/Monotonic/Cyclic) quando l'utente cambia il selettore
+        "Sorgente" ("OFF"/"LCR"/"ADS1220") su quella schermata. Serve solo a
+        tracciare centralmente se il canale ADS1220 è attivo, per poter
+        disabilitare "ADS1220 Settings" nel menu indipendentemente da quale
+        schermata è attualmente visibile (il firmware ha un unico stato
+        globale per il canale, non uno stato per schermata). """
+        self.active_resistance_source = source
+
+    def send_ads1220_config_to_firmware(self):
+        """
+        Costruisce e invia al firmware il comando SET_ADS1220_CONFIG usando
+        la configurazione ADS1220 corrente. Il firmware la rifiuta
+        (STATUS:ADS1220_CONFIG_REJECTED;REASON=POLLING_ACTIVE) se il canale
+        è attualmente in polling: qui la inviamo comunque (es. subito dopo la
+        connessione), il rifiuto viene gestito in handle_data_from_esp32().
+        """
+        command = (f"SET_ADS1220_CONFIG:SPS={self.current_ads1220_sps};"
+                   f"GAIN={self.current_ads1220_gain};"
+                   f"PGA_BYPASS={1 if self.current_ads1220_pga_bypass else 0};"
+                   f"IDAC={self.current_ads1220_idac_ua};"
+                   f"WINDOW={self.current_ads1220_window}")
+        self.communicator.send_command(command)
+
+    def show_ads1220_dialog(self):
+        """
+        Mostra la finestra di dialogo per configurare l'ADS1220. Disabilitato
+        (con messaggio esplicativo) mentre il canale è attivo su una
+        qualunque schermata: il firmware lo rifiuterebbe comunque, ma
+        evitiamo di far compilare un form che verrà scartato.
+        """
+        if self.active_resistance_source == "ADS1220":
+            QMessageBox.information(self, "Configurazione Non Disponibile",
+                                    "Il canale ADS1220 è attualmente attivo (in polling) su una delle "
+                                    "schermate. Disattivalo dal selettore 'Sorgente Resistenza' prima di "
+                                    "modificarne la configurazione.")
+            return
+
+        dialog = ADS1220ConfigDialog(self.current_ads1220_sps, self.current_ads1220_gain,
+                                      self.current_ads1220_pga_bypass, self.current_ads1220_idac_ua,
+                                      self.current_ads1220_window, self)
+        dialog.killswitch_indicator.set_state(self._killswitch_visual_state())
+        self._killswitch_indicators.append(dialog.killswitch_indicator)
+        try:
+            if dialog.exec():
+                new_sps, new_gain, new_pga_bypass, new_idac_ua, new_window = dialog.get_values()
+                self.current_ads1220_sps = new_sps
+                self.current_ads1220_gain = new_gain
+                self.current_ads1220_pga_bypass = new_pga_bypass
+                self.current_ads1220_idac_ua = new_idac_ua
+                self.current_ads1220_window = new_window
+                self.send_ads1220_config_to_firmware()
+                # Nota: il messaggio di conferma effettivo (coi valori REALMENTE
+                # applicati dal firmware, es. PGA_BYPASS forzato se gain>=8x)
+                # arriva in modo asincrono su STATUS:ADS1220_CONFIG_SET, gestito
+                # in handle_data_from_esp32().
+        finally:
+            self._killswitch_indicators.remove(dialog.killswitch_indicator)
 
 
 

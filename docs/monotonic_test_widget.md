@@ -15,9 +15,15 @@ reale e in overlay con test precedenti, e fa autosave in Excel a fine test.
   - Stato interno principale: `specimens` (dict nome→dati provino),
     `current_specimen_name`, `is_test_running`, `absolute_load_N` /
     `load_offset_N`, `absolute_displacement_mm` / `displacement_offset_mm`,
-    `current_test_data` (lista di tuple a 7 elementi: `time_s, rel_disp,
-    rel_load, abs_disp, abs_load, resistance_ohm, encoder_disp_mm` — l'ultimo
-    è l'encoder **assoluto**, non relativo), `current_resistance_ohm`,
+    `current_test_data` (lista di tuple a 8 elementi: `time_s, rel_disp,
+    rel_load, abs_disp, abs_load, resistance_ohm, encoder_disp_mm,
+    resistance_source` — il penultimo è l'encoder **assoluto**, non
+    relativo, l'ultimo è la sorgente resistenza attiva in maiuscolo,
+    `"OFF"/"LCR"/"ADS1220"`), `current_resistance_ohm` (valore della sorgente
+    attualmente selezionata in `resistance_source_combo`, calcolato da
+    `_current_active_resistance_ohm()`), `current_resistance_lcr_ohm` /
+    `current_resistance_ads_ohm` (valori grezzi dei due canali alternativi,
+    propagati da `MainWindow` indipendentemente da quale sia selezionata),
     `absolute_encoder_displacement_mm` (canale dell'encoder incrementale
     esterno, sola lettura — `None` se il pacchetto `D:` non lo include, per
     retrocompatibilità), `encoder_displacement_offset_mm` (zero relativo
@@ -71,14 +77,24 @@ reale e in overlay con test precedenti, e fa autosave in Excel a fine test.
     `current_test_data` nel provino, fa autosave automatico in
     `AUTOSAVE_<nome>_<timestamp>.xlsx` tramite `DataSaver`, e se il provino
     ha `return_to_start=True` invia `RETURN_TO_START`.
-  - `handle_stream_data(load_N, disp_mm, time_s, cycle_count, resistance_ohm,
-    encoder_disp_mm=None)`: chiamato da `MainWindow` per ogni pacchetto `D:`
-    mentre il widget è quello corrente; aggiorna i valori assoluti, accoda un
-    punto dati, e aggiorna la curva live (con conversione opzionale
-    Strain/Stress in base ai combo box degli assi). `encoder_disp_mm` non
-    entra mai in nessuna validazione di sicurezza; entra invece nel grafico
-    come sorgente X alternativa (vedi sotto), oltre che nel
+  - `handle_stream_data(load_N, disp_mm, time_s, cycle_count,
+    resistance_lcr_ohm, resistance_ads_ohm, encoder_disp_mm=None)`: chiamato
+    da `MainWindow` per ogni pacchetto `D:` mentre il widget è quello
+    corrente; aggiorna i valori assoluti (inclusi entrambi i canali di
+    resistenza grezzi, poi risolve `current_resistance_ohm` in base al
+    combo), accoda un punto dati, e aggiorna la curva live (con conversione
+    opzionale Strain/Stress in base ai combo box degli assi). `encoder_disp_mm`
+    non entra mai in nessuna validazione di sicurezza; entra invece nel
+    grafico come sorgente X alternativa (vedi sotto), oltre che nel
     `DisplayWidget` "Relative Enc. Displacement (mm)".
+  - **Resistenza campioni (LCR/ADS1220, canali alternativi)**:
+    `resistance_source_combo` (`"Off"/"LCR"/"ADS1220"`, sostituisce il
+    vecchio checkbox "Enable LCR Reading"), `_on_resistance_source_changed()`
+    invia la coppia `ENABLE_*`/`DISABLE_*` appropriata ed emette
+    `resistance_source_changed` (letto solo da `MainWindow` per il gating
+    del dialog "ADS1220 Settings"). Stessa logica duplicata in
+    `manual_control_widget.py`/`cyclic_test_widget.py` — vedi
+    `docs/manual_control_widget.md` per il dettaglio comune.
   - **Sorgente X del grafico (Motor/Encoder)**: due checkbox
     (`x_source_motor_checkbox`, `x_source_encoder_checkbox`, visibili solo
     quando `x_axis_combo` è su "Relative Displacement (mm)", gestite da
@@ -99,8 +115,9 @@ reale e in overlay con test precedenti, e fa autosave in Excel a fine test.
     (`main_window.current_disp_limit_mm` / `current_force_limit_N`) prima di
     permettere il salvataggio del provino.
   - `refresh_plot()`: ridisegna il grafico principale (una curva per ogni
-    sorgente X attiva, per provino se in overlay) e, se abilitato, l'asse
-    secondario per la resistenza LCR (crea/distrugge dinamicamente una
+    sorgente X attiva, per provino se in overlay) e, se
+    `resistance_source_combo` non è su "Off", l'asse secondario per la
+    resistenza (crea/distrugge dinamicamente una
     `pg.ViewBox` secondaria agganciata all'asse destro; la curva resistenza
     resta ancorata alla sorgente X "motor" quando entrambe sono attive).
   - `convert_speed()` / `convert_stop_criterion()`: conversioni pure

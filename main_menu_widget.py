@@ -13,6 +13,7 @@ class MainMenuWidget(QWidget):
         # --- Creazione pulsanti ---
         self.calibrate_button = QPushButton("Calibrate Load Cell")
         self.filter_button = QPushButton("Filter Config")
+        self.ads1220_button = QPushButton("ADS1220 Settings")
         self.manual_button = QPushButton("Manual Control")
         self.monotonic_button = QPushButton("Monotonic Test")
         self.cyclic_button = QPushButton("Cyclic Test")
@@ -24,23 +25,25 @@ class MainMenuWidget(QWidget):
         buttons = [
             self.calibrate_button,
             self.filter_button,
+            self.ads1220_button,
             self.manual_button,
-            self.monotonic_button, 
-            self.cyclic_button, 
+            self.monotonic_button,
+            self.cyclic_button,
             self.exit_button
         ]
-        
+
         for button in buttons:
-            button.setMinimumHeight(75) 
+            button.setMinimumHeight(75)
             button.setFont(button_font)
             layout.addWidget(button)
 
         layout.addStretch(1)
         layout.setSpacing(20)
-        
+
         # --- Stato dei pulsanti ---
         self.calibrate_button.setEnabled(True)
         self.filter_button.setEnabled(True)
+        self.ads1220_button.setEnabled(True)
         self.monotonic_button.setEnabled(True) # MODIFICA: Abilitato per accedere alla nuova schermata
         self.cyclic_button.setEnabled(True)
         self.exit_button.clicked.connect(QApplication.instance().quit)

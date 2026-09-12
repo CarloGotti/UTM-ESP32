@@ -4,8 +4,14 @@
 
 Raccolta di widget Qt riusabili e senza logica applicativa specifica,
 condivisi da tutte le schermate: un indicatore numerico standard, una barra
-di velocità colorata, il dialog dei limiti di sicurezza macchina e il dialog
-di configurazione del filtro della cella di carico.
+di velocità colorata, il dialog dei limiti di sicurezza macchina, il dialog
+di configurazione del filtro della cella di carico e il dialog di
+configurazione dell'ADS1220 (canale di resistenza campioni alternativo
+all'LCR).
+
+> Nota: questo file documenta anche `KillswitchIndicatorWidget`/
+> `KillswitchBannerWidget`, non ancora descritti più sotto in questa pagina —
+> vedi `CLAUDE.md`, sezione Killswitch, per il loro comportamento.
 
 ## Classi e funzioni principali
 
@@ -37,6 +43,18 @@ di configurazione del filtro della cella di carico.
   cambia — quello arriva separatamente e in modo asincrono dalla GUI
   quando il firmware conferma l'invalidazione della calibrazione (vedi
   `docs/main.md`).
+- **`ADS1220ConfigDialog(QDialog)`** — form con `QComboBox` per sample rate
+  (`"20/45/90/175/330/600/1000 SPS"`), guadagno PGA
+  (`"1x"`..`"128x"`) e corrente IDAC1 (`"0/10/50/100/250/500/1000/1500 uA"`),
+  un `QCheckBox` "Bypass PGA" (ha effetto solo se il guadagno scelto è < 8x,
+  nota esplicita nel dialog) e un `QDoubleSpinBox` per la finestra della
+  media mobile (1–20 campioni). Stesso pattern di `FilterConfigDialog`:
+  `get_values()` ritorna `(sps, gain, pga_bypass, idac_ua, window)`, non
+  invia nulla da solo — è `MainWindow.show_ads1220_dialog()` a costruire e
+  inviare `SET_ADS1220_CONFIG`, dopo aver verificato che il canale non sia
+  già attivo su nessuna schermata (`active_resistance_source`, vedi
+  `docs/main.md`), perché il firmware lo rifiuterebbe comunque mentre è in
+  polling.
 
 ## Dipendenze
 

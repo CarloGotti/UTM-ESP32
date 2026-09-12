@@ -323,6 +323,10 @@ class SpecimenDialog(QDialog):
 class CyclicTestWidget(QWidget):
     back_to_menu_requested = pyqtSignal()
     limits_button_requested = pyqtSignal() # Segnale per i limiti
+    # Emesso quando l'utente cambia il selettore "Sorgente Resistenza"
+    # ("OFF"/"LCR"/"ADS1220"): MainWindow lo usa per tracciare centralmente
+    # se il canale ADS1220 è attivo (gating del dialog impostazioni).
+    resistance_source_changed = pyqtSignal(str)
 
     def __init__(self, communicator, main_window, parent=None):
         super().__init__(parent)
@@ -342,10 +346,21 @@ class CyclicTestWidget(QWidget):
         self.specimens = {} # Aggiunto per gestione batch
         self.current_specimen_name = None # Aggiunto per gestione batch
         self.current_test_data = []
-        self.current_resistance_ohm = -999.0 # Per memorizzare l'ultimo valore LCR
+        # Resistenza campioni: due canali alternativi (LCR-meter esterno / ADS1220),
+        # mai attivi insieme (vedi resistance_source_combo). current_resistance_ohm
+        # è il valore della sorgente attualmente selezionata; current_resistance_lcr_ohm/
+        # current_resistance_ads_ohm sono i valori grezzi dell'ultimo pacchetto D:.
+        self.current_resistance_ohm = -999.0
+        self.current_resistance_lcr_ohm = -999.0
+        self.current_resistance_ads_ohm = -999.0
         self.absolute_encoder_displacement_mm = None # Canale encoder esterno (sola lettura, Livello 1)
         self.encoder_displacement_offset_mm = 0.0 # Zero relativo del canale encoder
         self.is_goto_active = False # True mentre un movimento "Go To" è in corso
+        # Stato killswitch (vedi CLAUDE.md): avvio prova e GOTO bloccati mentre
+        # position_unverified è True (stato giallo o rosso); Up/Down bloccati
+        # solo in stato rosso (killswitch_engaged).
+        self._killswitch_engaged = False
+        self._position_unverified = False
         # --- FONT E LOCALE ---
         general_font = QFont("Segoe UI", 11)
         button_font = QFont("Segoe UI", 10, QFont.Weight.Bold)
@@ -367,7 +382,9 @@ class CyclicTestWidget(QWidget):
         self.resistance_display = DisplayWidget("Resistance (Ω)") # <-- NUOVO DISPLAY
         self.encoder_disp_display = DisplayWidget("Encoder Displacement (mm)")
         self.rel_encoder_disp_display = DisplayWidget("Relative Enc. Displacement (mm)")
-        self.lcr_enable_checkbox = QCheckBox("Enable LCR Reading")
+        self.resistance_source_label = QLabel("Resistance Source:")
+        self.resistance_source_combo = QComboBox()
+        self.resistance_source_combo.addItems(["Off", "LCR", "ADS1220"])
 
         top_section_layout.addWidget(self.abs_load_display)
         top_section_layout.addWidget(self.rel_load_display)
@@ -380,7 +397,8 @@ class CyclicTestWidget(QWidget):
         top_section_layout.addWidget(self.encoder_disp_display)
         top_section_layout.addWidget(self.rel_encoder_disp_display)
         top_section_layout.addStretch(1)
-        top_section_layout.addWidget(self.lcr_enable_checkbox)
+        top_section_layout.addWidget(self.resistance_source_label)
+        top_section_layout.addWidget(self.resistance_source_combo)
 
         jog_controls_layout = QVBoxLayout()
         self.up_button = QPushButton("↑ UP ↑"); self.up_button.setFont(button_font)
@@ -612,7 +630,7 @@ class CyclicTestWidget(QWidget):
         self.x_axis_combo.currentIndexChanged.connect(self.refresh_plot)
         self.y_axis_combo.currentIndexChanged.connect(self.refresh_plot)
         self.x_axis_combo.currentIndexChanged.connect(self._update_x_source_controls_visibility)
-        self.lcr_enable_checkbox.stateChanged.connect(self._on_lcr_checkbox_changed)
+        self.resistance_source_combo.currentTextChanged.connect(self._on_resistance_source_changed)
 
         self.update_ui_for_test_state()
         self.update_displays()
@@ -622,6 +640,15 @@ class CyclicTestWidget(QWidget):
     # --- Metodi Placeholder per la Logica ---
 
     def on_start_test(self):
+        # Difesa in profondità: oltre alla disabilitazione del pulsante (vedi
+        # update_ui_for_test_state()), rifiuta esplicitamente l'avvio se la
+        # posizione non è verificata (killswitch attivato in precedenza,
+        # homing non ancora ripetuto). Il firmware la rifiuterebbe comunque.
+        if self._position_unverified:
+            QMessageBox.warning(self, "Posizione Non Verificata",
+                                 "Il killswitch è stato attivato in precedenza: eseguire nuovamente "
+                                 "l'HOMING prima di avviare una prova.")
+            return
 
         # --- VALIDAZIONE PROVINO (invariata) ---
         if self.current_specimen_name is None:
@@ -729,8 +756,8 @@ class CyclicTestWidget(QWidget):
         else:
              print("DEBUG: Nessun comando valido da inviare per il primo blocco.") # Debug aggiuntivo
     
-    def on_stop_test(self, user_initiated=True):
-        print(f"DEBUG Cyclic: on_stop_test chiamato (user_initiated={user_initiated})")
+    def on_stop_test(self, user_initiated=True, abort_reason=None):
+        print(f"DEBUG Cyclic: on_stop_test chiamato (user_initiated={user_initiated}, abort_reason={abort_reason})")
 
         # Il pulsante STOP principale deve poter interrompere anche un
         # movimento "Go To" in corso, non solo un test (era il bug segnalato:
@@ -774,17 +801,23 @@ class CyclicTestWidget(QWidget):
                 # Prepara i dati del provino, INCLUDENDO la sequenza di test
                 specimen_data_to_save = {
                     **self.specimens[self.current_specimen_name],
-                    "test_sequence_setup": self.test_sequence 
+                    "test_sequence_setup": self.test_sequence,
+                    # Marca esplicitamente il provino come interrotto dal
+                    # killswitch (non completato/stoppato dall'utente): letto
+                    # da DataSaver per annotarlo nel foglio salvato. None nei
+                    # casi normali (non aggiunge nulla al file, invariato).
+                    "abort_reason": abort_reason,
                 }
                 specimen_to_save = {self.current_specimen_name: specimen_data_to_save}
 
-                # Crea un nome di file automatico
-                filename = f"AUTOSAVE_CYCLIC_{self.current_specimen_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+                # Nome di file distinto se l'interruzione è dovuta al killswitch
+                prefix = "AUTOSAVE_CYCLIC_KILLSWITCH_ABORTED" if abort_reason == "KILLSWITCH" else "AUTOSAVE_CYCLIC"
+                filename = f"{prefix}_{self.current_specimen_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
 
                 saver = DataSaver()
                 # Salva il singolo provino usando la stessa logica del batch
                 # Passiamo None come info calibrazione per ora (o aggiungila se serve)
-                saver.save_batch_to_xlsx(specimen_to_save, filename, "N/A") 
+                saver.save_batch_to_xlsx(specimen_to_save, filename, "N/A")
                 print(f"DEBUG: Autosave ciclico completato per {self.current_specimen_name} in {filename}")
             except Exception as e:
                 print(f"ERRORE AUTOSAVE CICLICO: {e}")
@@ -796,7 +829,7 @@ class CyclicTestWidget(QWidget):
         self.refresh_plot()
         # --- FINE CORREZIONE ---
     
-    def handle_stream_data(self, load_N, disp_mm, time_s, cycle_count, resistance_ohm, encoder_disp_mm=None):
+    def handle_stream_data(self, load_N, disp_mm, time_s, cycle_count, resistance_lcr_ohm, resistance_ads_ohm, encoder_disp_mm=None):
         if not self.is_test_running:
             return
 
@@ -805,14 +838,20 @@ class CyclicTestWidget(QWidget):
         self.absolute_displacement_mm = disp_mm
         self.elapsed_time_s = time_s
         self.current_cycle = cycle_count
-        self.current_resistance_ohm = resistance_ohm
+        self.current_resistance_lcr_ohm = resistance_lcr_ohm
+        self.current_resistance_ads_ohm = resistance_ads_ohm
+        self.current_resistance_ohm = self._current_active_resistance_ohm()
         self.absolute_encoder_displacement_mm = encoder_disp_mm
         relative_disp = disp_mm - self.displacement_offset_mm
         relative_load = load_N - self.load_offset_N
+        resistance_source = self.resistance_source_combo.currentText().upper()
 
-        # 2. Aggiunge dati (canale encoder in coda, accanto allo spostamento a passi)
+        # 2. Aggiunge dati (canale encoder e sorgente resistenza in coda,
+        # accanto allo spostamento a passi)
         current_block_num = self.current_block_index + 1
-        self.current_test_data.append((time_s, relative_disp, relative_load, disp_mm, load_N, cycle_count, current_block_num, resistance_ohm, encoder_disp_mm))
+        self.current_test_data.append((time_s, relative_disp, relative_load, disp_mm, load_N, cycle_count,
+                                        current_block_num, self.current_resistance_ohm, encoder_disp_mm,
+                                        resistance_source))
 
         # 3. Aggiorna il grafico
         specimen = self.specimens.get(self.current_specimen_name,
@@ -921,16 +960,26 @@ class CyclicTestWidget(QWidget):
             self.rel_encoder_disp_display.set_value(f"{relative_encoder_disp:.4f}")
 
 
+    def set_killswitch_state(self, engaged, position_unverified):
+        """ Chiamato da MainWindow a ogni transizione di stato del killswitch. """
+        self._killswitch_engaged = engaged
+        self._position_unverified = position_unverified
+        self.update_ui_for_test_state()
+
     def update_ui_for_test_state(self):
         is_running = self.is_test_running
-        self.start_button.setEnabled(not is_running and not self.is_goto_active and self.is_homed and len(self.test_sequence) > 0)
+        # Avvio prova e GOTO bloccati mentre la posizione non è verificata
+        # (stato giallo o rosso): un HOME riuscito è l'unico modo per sbloccarli.
+        position_blocked = self._position_unverified
+        self.start_button.setEnabled(not is_running and not self.is_goto_active and self.is_homed
+                                      and len(self.test_sequence) > 0 and not position_blocked)
         # Abilitato anche durante un Go To: deve poter interrompere entrambi
         # (vedi on_stop_test()/_cancel_goto())
         self.stop_button.setEnabled(is_running or self.is_goto_active)
         self.back_button.setEnabled(not is_running)
         # Blocca i controlli della sequenza e gli zeri durante il test
         widgets_to_toggle = [
-            self.jog_speed_spinbox, self.goto_button, self.sequence_list, self.add_block_button, self.add_pause_button,
+            self.jog_speed_spinbox, self.sequence_list, self.add_block_button, self.add_pause_button,
             self.edit_block_button, self.remove_block_button,
             self.zero_rel_load_button, self.zero_rel_disp_button,
             self.limits_button, self.finish_save_button
@@ -938,12 +987,18 @@ class CyclicTestWidget(QWidget):
         for widget in widgets_to_toggle:
             widget.setEnabled(not is_running)
 
-        # Up/Down/posizione Go To sono disabilitati anche durante un
-        # movimento "Go To" già in corso, non solo durante un test. Il
-        # pulsante Go To stesso resta invece abilitato (a meno di un test in
-        # corso): è lui a diventare "STOP" mentre il movimento è attivo.
-        for widget in (self.up_button, self.down_button, self.goto_position_spinbox):
-            widget.setEnabled(not is_running and not self.is_goto_active)
+        # Go To: disabilitato anche in stato giallo/rosso, oltre che durante
+        # un test (a differenza di Up/Down, non dipende da is_goto_active:
+        # deve restare cliccabile durante il proprio movimento per fungere da STOP).
+        self.goto_button.setEnabled(not is_running and not position_blocked)
+        self.goto_position_spinbox.setEnabled(not is_running and not self.is_goto_active and not position_blocked)
+
+        # Up/Down: disabilitati anche durante un movimento "Go To" già in
+        # corso o durante un test, e solo in stato "rosso" (killswitch
+        # premuto ora) — restano invece utilizzabili in stato "giallo".
+        jog_blocked = self._killswitch_engaged
+        for widget in (self.up_button, self.down_button):
+            widget.setEnabled(not is_running and not self.is_goto_active and not jog_blocked)
 
     def set_homing_status(self, is_homed):
         self.is_homed = is_homed
@@ -1476,6 +1531,12 @@ class CyclicTestWidget(QWidget):
         STOP principale (self.stop_button, gestito da on_stop_test) può
         interrompere lo stesso movimento, vedi _cancel_goto(). """
         if not self.is_goto_active:
+            # Difesa in profondità: vedi commento analogo in on_start_test().
+            if self._position_unverified:
+                QMessageBox.warning(self, "Posizione Non Verificata",
+                                     "Il killswitch è stato attivato in precedenza: eseguire nuovamente "
+                                     "l'HOMING prima di un GO TO.")
+                return
             target_mm = self.goto_position_spinbox.value()
             self.set_speed()  # applica la velocità di Jog Speed corrente
             self.communicator.send_command(f"GOTO:{target_mm:.4f}")
@@ -1711,7 +1772,7 @@ class CyclicTestWidget(QWidget):
                         except Exception as e: print(f"Errore disegno non-overlay {self.current_specimen_name}/{source} (Cyclic): {e}")
 
         # --- 5. Logica Secondo Asse Y (Resistenza) (Metodo ManualControl) ---
-        lcr_enabled = self.lcr_enable_checkbox.isChecked()
+        lcr_enabled = (self.resistance_source_combo.currentText() != "Off")
 
         if lcr_enabled:
             try:
@@ -1939,17 +2000,35 @@ class CyclicTestWidget(QWidget):
             else:
                 QMessageBox.critical(self, "Errore", message)
 
-    def _on_lcr_checkbox_changed(self, state):
-        """ Invia il comando appropriato all'ESP32 quando il checkbox cambia stato. """
-        if state == Qt.CheckState.Checked.value:
-            print("DEBUG GUI: Abilitazione LCR Polling")
+    def _current_active_resistance_ohm(self):
+        """ Valore di resistenza della sorgente attualmente selezionata nel
+        combo (o -999.0 se "Off" o nessun dato ancora ricevuto per quella
+        sorgente). """
+        source = self.resistance_source_combo.currentText()
+        if source == "LCR":
+            return self.current_resistance_lcr_ohm
+        elif source == "ADS1220":
+            return self.current_resistance_ads_ohm
+        return -999.0
+
+    def _on_resistance_source_changed(self, text):
+        """ Invia ENABLE_*/DISABLE_* al cambio di sorgente: LCR e ADS1220 non
+        sono mai richiesti attivi insieme (vedi CLAUDE.md). """
+        if text == "LCR":
             self.communicator.send_command("ENABLE_LCR_POLLING")
-        else:
-            print("DEBUG GUI: Disabilitazione LCR Polling")
+            self.communicator.send_command("DISABLE_ADS1220_POLLING")
+        elif text == "ADS1220":
+            self.communicator.send_command("ENABLE_ADS1220_POLLING")
             self.communicator.send_command("DISABLE_LCR_POLLING")
-            # Resetta subito il display a "N/A"
-            self.current_resistance_ohm = -999.0
-        
+        else:  # "Off"
+            self.communicator.send_command("DISABLE_LCR_POLLING")
+            self.communicator.send_command("DISABLE_ADS1220_POLLING")
+        # Evita di mostrare/salvare un valore residuo della sorgente precedente.
+        self.current_resistance_lcr_ohm = -999.0
+        self.current_resistance_ads_ohm = -999.0
+        self.current_resistance_ohm = -999.0
+        self.resistance_source_changed.emit(text.upper())
+
         # --- MODIFICA ---
         # Chiama la nuova funzione di plotting
         self.refresh_plot()

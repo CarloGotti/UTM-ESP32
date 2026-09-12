@@ -4,17 +4,21 @@
 
 Persistenza minimale su file JSON (`settings.json`, nella working directory
 dell'app) delle impostazioni applicative. Gestisce i carichi di calibrazione
-(`cal_loads`) per cella e la configurazione del filtro EMA della cella di
-carico (`filter_config`).
+(`cal_loads`) per cella, la configurazione del filtro EMA della cella di
+carico (`filter_config`) e la configurazione dell'ADS1220 (`ads1220_config`).
 
 ## Classi e funzioni principali
 
 - **`SettingsManager`**
   - `__init__(filename="settings.json")`: definisce `default_settings` con
     `cal_loads` precompilato per le celle `1N, 10N, 50N, 100N, 200N` (ognuna
-    come `[zero_load_g, cal_load_g]`) e `filter_config` precompilato con
+    come `[zero_load_g, cal_load_g]`), `filter_config` precompilato con
     `{"alpha": 0.5, "rate_sps": 320, "gain": 128}` (default del firmware
-    NAU7802, gain 128x coincidente col default interno della libreria).
+    NAU7802, gain 128x coincidente col default interno della libreria) e
+    `ads1220_config` precompilato con `{"sps": 330, "gain": 16,
+    "pga_bypass": False, "idac_ua": 1500, "window": 10}` (default del
+    firmware ADS1220, allineati esattamente ai valori di registro verificati
+    da datasheet — vedi `CLAUDE.md`, sezione ADS1220).
   - `load_settings()`: se il file esiste lo legge e fa il merge delle chiavi
     mancanti con i default (senza sovrascrivere quelle presenti); se il JSON
     è corrotto, stampa un avviso e ritorna i default **senza però
@@ -33,7 +37,13 @@ carico (`filter_config`).
 - `MainWindow` legge anche `settings['filter_config']` per inizializzare
   `current_filter_alpha`/`current_filter_rate_sps`/`current_filter_pga_gain`,
   e li ri-salva tramite `save_settings()` da `show_filter_dialog()` quando
-  l'utente conferma una nuova configurazione da "Filter Config".
+  l'utente conferma una nuova configurazione da "Filter Config". Stesso
+  discorso per `settings['ads1220_config']` (→ `current_ads1220_sps`/`gain`/
+  `pga_bypass`/`idac_ua`/`window`), con una differenza: il ri-salvataggio non
+  avviene all'accettazione del dialog ma **in modo asincrono**, quando
+  arriva `STATUS:ADS1220_CONFIG_SET` dal firmware (che riporta i valori
+  realmente applicati, potenzialmente diversi da quelli richiesti per
+  `PGA_BYPASS` — vedi `docs/main.md` e `CLAUDE.md`).
 - Nessuna dipendenza verso altri moduli: usa solo `json` e `os` dalla
   standard library.
 

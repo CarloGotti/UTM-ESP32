@@ -20,16 +20,19 @@ dati tabellari e grafici Scatter incorporati.
     del provino (non un campo esplicito tipo `"test_type"`). Scrive i
     parametri di setup, poi la tabella dati con intestazioni fisse:
     `Time, Relative Displacement, Relative Load, Strain, Stress, Absolute
-    Displacement, Absolute Load, Resistance, Encoder Displacement`
-    (+`Cycle`, `Block` se ciclico). `Encoder Displacement (mm)` è il canale
+    Displacement, Absolute Load, Resistance, Resistance Source, Encoder
+    Displacement` (+`Cycle`, `Block` se ciclico). `Resistance Source`
+    (`"LCR"/"ADS1220"/"OFF"`) registra quale dei due canali alternativi era
+    attivo per quel punto dati. `Encoder Displacement (mm)` è il canale
     di sola lettura dell'encoder incrementale esterno (vedi `CHANGELOG.md`):
     scritto **accanto**, non al posto, di `Absolute/Relative Displacement`
     (che restano la stima a passi motore), per permettere il confronto tra i
     due nei dati salvati. Interpreta le tuple di `test_data` per
-    **lunghezza**: 7 elementi per monotonico/registrazione manuale (con
-    resistenza ed encoder), 9 per ciclico (con cycle/block/resistenza/
-    encoder). Se l'ultimo elemento è `None` (pacchetto storico senza
-    encoder, o parsing fallito lato Python), scrive `NaN` nella colonna.
+    **lunghezza**: 8 elementi per monotonico/registrazione manuale (con
+    resistenza, encoder e sorgente resistenza), 10 per ciclico (con
+    cycle/block/resistenza/encoder/sorgente resistenza). Se un elemento è
+    `None` (pacchetto storico senza encoder, o parsing fallito lato Python),
+    scrive `NaN`/stringa vuota nella colonna corrispondente.
   - `_format_block_description(block, index)`: converte un dizionario-blocco
     (nello stesso formato usato da `cyclic_test_widget.py`) in una riga di
     testo leggibile, per il riepilogo "Test Sequence" scritto nel foglio.
@@ -50,11 +53,12 @@ dati tabellari e grafici Scatter incorporati.
 ## Punti di attenzione
 
 - Il **contratto di formato delle tuple** in `test_data` è implicito e basato
-  sulla posizione e sulla lunghezza (`len(data_row) == 7` vs `== 9`): se un
+  sulla posizione e sulla lunghezza (`len(data_row) == 8` vs `== 10`): se un
   chiamante cambia l'ordine o il numero di campi in una tupla senza
   aggiornare questo file, i dati vengono scritti nelle colonne sbagliate
   senza errori espliciti (l'unico segnale sarebbe
-  `resistance`/`cycle`/`block`/`encoder_disp` che restano `NaN`).
+  `resistance`/`cycle`/`block`/`encoder_disp`/`resistance_source` che restano
+  `NaN`/vuoti).
 - Analogamente, la distinzione ciclico/monotonico basata sulla presenza della
   chiave `"test_sequence_setup"` è fragile: un dizionario provino che la
   contenga per errore (es. copiato da un provino ciclico) verrebbe trattato

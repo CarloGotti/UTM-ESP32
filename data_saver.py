@@ -53,7 +53,7 @@ class DataSaver:
         params = {
             "Specimen Name": specimen_name,
             "Test Date": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "Calibration Info": calibration_info, 
+            "Calibration Info": calibration_info,
             "Gauge Length (mm)": specimen_data.get("gauge_length"),
             "Area (mm²)": specimen_data.get("area"),
         }
@@ -62,6 +62,18 @@ class DataSaver:
         for key, value in params.items():
             sheet[f"A{row}"] = key
             sheet[f"B{row}"] = value
+            row += 1
+
+        # Se il test è stato interrotto da un evento esterno (es. killswitch,
+        # vedi CLAUDE.md), annotalo esplicitamente e in modo visibile: non è
+        # né un test completato normalmente né un errore generico. Assente
+        # (None) nel caso normale, quindi non aggiunge nulla al file esistente.
+        abort_reason = specimen_data.get("abort_reason")
+        if abort_reason:
+            sheet[f"A{row}"] = "Test Status"
+            status_cell = sheet[f"B{row}"]
+            status_cell.value = f"INTERRUPTED — {abort_reason}"
+            status_cell.font = openpyxl.styles.Font(bold=True, color="FFCC0000")
             row += 1
 
         if is_cyclic:
@@ -94,6 +106,9 @@ class DataSaver:
         ]
 
         headers.append("Resistance (Ohm)")
+        # Sorgente della misura di resistenza attiva durante la prova: "LCR",
+        # "ADS1220" o "OFF" (canali alternativi, mai attivi insieme — vedi CLAUDE.md).
+        headers.append("Resistance Source")
         # Canale di misura aggiuntivo (encoder incrementale esterno, sola
         # lettura): affiancato, non sostituisce, lo spostamento stimato a
         # passi nelle colonne precedenti.
@@ -109,25 +124,28 @@ class DataSaver:
 
         for i, data_row in enumerate(test_data):
             resistance = np.nan
+            resistance_source = ""
             cycle = np.nan
             block = np.nan
             encoder_disp = np.nan
             time_s, rel_disp, rel_load, abs_disp, abs_load = data_row[:5]
 
             if is_cyclic:
-                # Tupla ciclica: (... cycle, block, resistance, encoder_disp) - 9 elementi
-                if len(data_row) == 9: # <-- CONTROLLA LUNGHEZZA
+                # Tupla ciclica: (... cycle, block, resistance, encoder_disp, resistance_source) - 10 elementi
+                if len(data_row) == 10: # <-- CONTROLLA LUNGHEZZA
                     cycle = data_row[5]
                     block = data_row[6]
                     resistance = data_row[7] # <-- ESTRAE RESISTENZA DALL'INDICE 7
                     if data_row[8] is not None:
                         encoder_disp = data_row[8] # <-- ESTRAE ENCODER DALL'INDICE 8
+                    resistance_source = data_row[9] # <-- ESTRAE SORGENTE DALL'INDICE 9
             else: # Monotonico / registrazione manuale
-                # Tupla monotonica: (... resistance, encoder_disp) - 7 elementi
-                if len(data_row) == 7: # <-- CONTROLLA LUNGHEZZA
+                # Tupla monotonica: (... resistance, encoder_disp, resistance_source) - 8 elementi
+                if len(data_row) == 8: # <-- CONTROLLA LUNGHEZZA
                     resistance = data_row[5] # <-- ESTRAE RESISTENZA DALL'INDICE 5
                     if data_row[6] is not None:
                         encoder_disp = data_row[6] # <-- ESTRAE ENCODER DALL'INDICE 6
+                    resistance_source = data_row[7] # <-- ESTRAE SORGENTE DALL'INDICE 7
 
             is_gauge_valid = isinstance(gauge, (int, float)) and not np.isnan(gauge) and gauge > 0
             is_area_valid = isinstance(area, (int, float)) and not np.isnan(area) and area > 0
@@ -144,10 +162,11 @@ class DataSaver:
             sheet.cell(row=current_excel_row, column=6, value=abs_disp)
             sheet.cell(row=current_excel_row, column=7, value=abs_load)
             sheet.cell(row=current_excel_row, column=8, value=resistance)
-            sheet.cell(row=current_excel_row, column=9, value=encoder_disp)
+            sheet.cell(row=current_excel_row, column=9, value=resistance_source)
+            sheet.cell(row=current_excel_row, column=10, value=encoder_disp)
             if is_cyclic:
-                sheet.cell(row=current_excel_row, column=10, value=cycle)
-                sheet.cell(row=current_excel_row, column=11, value=block)
+                sheet.cell(row=current_excel_row, column=11, value=cycle)
+                sheet.cell(row=current_excel_row, column=12, value=block)
 
         num_data_points = len(test_data)
         if num_data_points == 0:

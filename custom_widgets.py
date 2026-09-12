@@ -1,4 +1,4 @@
-from PyQt6.QtWidgets import QWidget, QVBoxLayout, QLabel, QFrame, QDialog, QFormLayout, QDialogButtonBox, QDoubleSpinBox, QComboBox, QMessageBox
+from PyQt6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QLabel, QFrame, QDialog, QFormLayout, QDialogButtonBox, QDoubleSpinBox, QComboBox, QMessageBox, QCheckBox
 from PyQt6.QtCore import Qt, QRectF, QLocale
 from PyQt6.QtGui import QFont, QPainter, QColor
 
@@ -75,6 +75,68 @@ class DisplayWidget(QWidget):
     def set_value(self, text):
         self.value_label.setText(text)
 
+class KillswitchIndicatorWidget(QWidget):
+    """
+    Indicatore compatto a tre livelli dello stato del killswitch hardware,
+    pensato per essere presente in ogni finestra dell'applicazione (finestra
+    principale e dialoghi modali come LIMITS/Filter Config).
+
+    - "green": normale (killswitch a riposo, posizione verificata).
+    - "yellow": killswitch rilasciato ma la posizione non è più verificata
+      (serve un HOMING riuscito).
+    - "red": killswitch premuto ora.
+    """
+    STATE_COLORS = {"green": "#2ECC71", "yellow": "#F1C40F", "red": "#E74C3C"}
+    STATE_TEXTS = {"green": "OK", "yellow": "HOMING REQUIRED", "red": "KILLSWITCH"}
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(4, 2, 4, 2)
+        layout.setSpacing(6)
+        self.dot_label = QLabel("●")  # ●
+        self.dot_label.setFont(QFont("Segoe UI", 16, QFont.Weight.Bold))
+        self.text_label = QLabel("")
+        self.text_label.setFont(QFont("Segoe UI", 10, QFont.Weight.Bold))
+        layout.addWidget(self.dot_label)
+        layout.addWidget(self.text_label)
+        self.set_state("green")
+
+    def set_state(self, state):
+        color = self.STATE_COLORS.get(state, "#7F8C8D")
+        text = self.STATE_TEXTS.get(state, "UNKNOWN")
+        self.dot_label.setStyleSheet(f"color: {color};")
+        self.text_label.setStyleSheet(f"color: {color};")
+        self.text_label.setText(text)
+
+
+class KillswitchBannerWidget(QFrame):
+    """
+    Banner persistente (in aggiunta al popup non bloccante, non alternativo)
+    che resta visibile finché lo stato del killswitch non torna verde, così
+    l'informazione non si perde se il popup viene chiuso.
+    """
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFrameShape(QFrame.Shape.Box)
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(10, 6, 10, 6)
+        self.label = QLabel("")
+        self.label.setFont(QFont("Segoe UI", 11, QFont.Weight.Bold))
+        self.label.setStyleSheet("color: white;")
+        layout.addWidget(self.label)
+        self.hide()
+
+    def set_state(self, state, message=""):
+        if state != "red" and state != "yellow":
+            self.hide()
+            return
+        color = "#E74C3C" if state == "red" else "#F39C12"
+        self.setStyleSheet(f"background-color: {color};")
+        self.label.setText(message)
+        self.show()
+
+
 class LimitsDialog(QDialog):
     """
     Finestra di dialogo per impostare i limiti massimi di forza e spostamento della macchina.
@@ -88,6 +150,11 @@ class LimitsDialog(QDialog):
         locale_c = QLocale("C")
 
         layout = QFormLayout(self)
+
+        # Indicatore killswitch: presente anche qui perché questa finestra di
+        # dialogo resta utilizzabile in stato giallo/rosso (vedi CLAUDE.md).
+        self.killswitch_indicator = KillswitchIndicatorWidget()
+        layout.addRow(self.killswitch_indicator)
 
         self.force_limit_spinbox = QDoubleSpinBox()
         self.force_limit_spinbox.setLocale(locale_c)
@@ -129,6 +196,11 @@ class FilterConfigDialog(QDialog):
         locale_c = QLocale("C")
         layout = QFormLayout(self)
 
+        # Indicatore killswitch: presente anche qui perché questa finestra di
+        # dialogo resta utilizzabile in stato giallo/rosso (vedi CLAUDE.md).
+        self.killswitch_indicator = KillswitchIndicatorWidget()
+        layout.addRow(self.killswitch_indicator)
+
         self.alpha_spinbox = QDoubleSpinBox()
         self.alpha_spinbox.setLocale(locale_c)
         self.alpha_spinbox.setDecimals(2)
@@ -162,3 +234,82 @@ class FilterConfigDialog(QDialog):
         rate_sps = int(self.rate_combo.currentText().split()[0])
         gain = int(self.gain_combo.currentText().rstrip('x'))
         return self.alpha_spinbox.value(), rate_sps, gain
+
+
+class ADS1220ConfigDialog(QDialog):
+    """
+    Finestra di dialogo per configurare l'ADC ADS1220 (misura resistenza
+    campioni, canale alternativo all'LCR-meter): sample rate, guadagno PGA,
+    bypass PGA, corrente IDAC e finestra della media mobile software.
+
+    Il chiamante (MainWindow) è responsabile di non aprire questo dialog
+    mentre il canale ADS1220 è attivo (il firmware rifiuterebbe comunque
+    SET_ADS1220_CONFIG con STATUS:ADS1220_CONFIG_REJECTED;REASON=POLLING_ACTIVE,
+    vedi CLAUDE.md) — mostra invece un messaggio esplicativo prima di aprirlo.
+    """
+    def __init__(self, current_sps, current_gain, current_pga_bypass, current_idac_ua, current_window, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Configurazione ADS1220 (Resistenza)")
+        self.setMinimumWidth(400)
+
+        locale_c = QLocale("C")
+        layout = QFormLayout(self)
+
+        # Indicatore killswitch: presente anche qui per coerenza con gli altri
+        # dialoghi di configurazione (LIMITS/Filter Config) — questo dialog
+        # resta comunque utilizzabile in stato giallo/rosso, non è un canale
+        # di sicurezza (vedi CLAUDE.md).
+        self.killswitch_indicator = KillswitchIndicatorWidget()
+        layout.addRow(self.killswitch_indicator)
+
+        self.sps_combo = QComboBox()
+        self.sps_combo.addItems(["20 SPS", "45 SPS", "90 SPS", "175 SPS", "330 SPS", "600 SPS", "1000 SPS"])
+        current_sps_text = f"{current_sps} SPS"
+        sps_index = self.sps_combo.findText(current_sps_text)
+        self.sps_combo.setCurrentIndex(sps_index if sps_index != -1 else 4)  # default 330 SPS
+
+        self.gain_combo = QComboBox()
+        self.gain_combo.addItems(["1x", "2x", "4x", "8x", "16x", "32x", "64x", "128x"])
+        current_gain_text = f"{current_gain}x"
+        gain_index = self.gain_combo.findText(current_gain_text)
+        self.gain_combo.setCurrentIndex(gain_index if gain_index != -1 else 4)  # default 16x
+
+        self.pga_bypass_checkbox = QCheckBox("Bypass PGA (solo se guadagno < 8x)")
+        self.pga_bypass_checkbox.setChecked(bool(current_pga_bypass))
+
+        self.idac_combo = QComboBox()
+        self.idac_combo.addItems(["0 uA", "10 uA", "50 uA", "100 uA", "250 uA", "500 uA", "1000 uA", "1500 uA"])
+        current_idac_text = f"{current_idac_ua} uA"
+        idac_index = self.idac_combo.findText(current_idac_text)
+        self.idac_combo.setCurrentIndex(idac_index if idac_index != -1 else 7)  # default 1500 uA
+
+        self.window_spinbox = QDoubleSpinBox()
+        self.window_spinbox.setLocale(locale_c)
+        self.window_spinbox.setDecimals(0)
+        self.window_spinbox.setRange(1, 20)
+        self.window_spinbox.setValue(current_window)
+
+        layout.addRow("Sample Rate:", self.sps_combo)
+        layout.addRow("Guadagno PGA:", self.gain_combo)
+        layout.addRow("", self.pga_bypass_checkbox)
+        layout.addRow("Corrente IDAC1:", self.idac_combo)
+        layout.addRow("Finestra media mobile (campioni):", self.window_spinbox)
+
+        note = QLabel("Nota: il bypass PGA viene ignorato dal firmware (PGA sempre attivo,\n"
+                       "come da datasheet) se il guadagno selezionato e' >= 8x.")
+        note.setStyleSheet("color: #7F8C8D; font-style: italic;")
+        layout.addRow(note)
+
+        button_box = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)
+        button_box.accepted.connect(self.accept)
+        button_box.rejected.connect(self.reject)
+        layout.addWidget(button_box)
+
+    def get_values(self):
+        """ Ritorna (sps: int, gain: int, pga_bypass: bool, idac_ua: int, window: int). """
+        sps = int(self.sps_combo.currentText().split()[0])
+        gain = int(self.gain_combo.currentText().rstrip('x'))
+        pga_bypass = self.pga_bypass_checkbox.isChecked()
+        idac_ua = int(self.idac_combo.currentText().split()[0])
+        window = int(self.window_spinbox.value())
+        return sps, gain, pga_bypass, idac_ua, window
