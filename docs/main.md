@@ -174,7 +174,7 @@ dall'ESP32.
   metodo, altrimenti si ricrea il gap di sincronizzazione già corretto (vedi
   `CHANGELOG.md`).
 - Le costanti meccaniche (`PULSES_PER_REV`, `GEAR_RATIO`, `SCREW_PITCH_MM`)
-  sono duplicate manualmente in `Controllo-Macchina-ESP32/src/main.cpp`.
+  sono duplicate manualmente in `firmware/src/main.cpp`.
   Cambiarle qui senza cambiarle anche nel firmware disallinea la conversione
   passi↔mm.
 - Il parsing di `STATUS:` è per substring (`"TOP_HIT" in status_message`), non

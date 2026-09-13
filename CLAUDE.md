@@ -1,17 +1,26 @@
 # UTM-ESP32 — Macchina di Trazione Universale
 
-Questo workspace contiene due progetti collegati che insieme pilotano una macchina da
-trazione/compressione da laboratorio:
+Questo repository (monorepo) contiene due progetti collegati che insieme pilotano una
+macchina da trazione/compressione da laboratorio:
 
-- **UTM-ESP32** (questa cartella) — applicazione desktop Python/PyQt6, gira sul PC e
+- **UTM-ESP32** (radice del repo) — applicazione desktop Python/PyQt6, gira sul PC e
   comunica via seriale USB con l'ESP32.
-- **Controllo-Macchina-ESP32** (`c:\Users\carlo\Documents\PlatformIO\Projects\Controllo-Macchina-ESP32`,
-  cartella secondaria del workspace) — firmware C++ (PlatformIO/Arduino) che gira
-  sull'ESP32, un unico file `src/main.cpp` (~1220 righe). Pilota un motore passo-passo
-  (vite senza fine), legge una cella di carico via NAU7802 (ADC I2C, libreria SparkFun
-  Qwiic Scale NAU7802) e opzionalmente un LCR-meter esterno via UART2.
+- **`firmware/`** (sottocartella di questo stesso repo) — firmware C++
+  (PlatformIO/Arduino) che gira sull'ESP32, un unico file `firmware/src/main.cpp`
+  (~1220 righe). Pilota un motore passo-passo (vite senza fine), legge una cella di
+  carico via NAU7802 (ADC I2C, libreria SparkFun Qwiic Scale NAU7802) e opzionalmente
+  un LCR-meter esterno via UART2.
 
-Sono due repository git separati e indipendenti.
+**Nota storica**: fino al 2026-09-13 il firmware viveva in un repository git separato
+(`Controllo-Macchina-ESP32`, in `c:\Users\carlo\Documents\PlatformIO\Projects\`, fuori
+dalla cartella OneDrive di questo progetto). È stato fuso qui con `git subtree`
+(mantenendo tutta la sua cronologia commit, visibile in `git log -- firmware/`) per
+avere un solo repo da clonare/sincronizzare e poter fare commit atomici che toccano
+sia GUI sia firmware. Il vecchio repo `Controllo-Macchina-ESP32` su GitHub è stato
+archiviato (sola lettura); la sua cartella locale originale è stata rinominata
+`Controllo-Macchina-ESP32_OLD_backup` invece di essere cancellata. Chi apre il
+progetto in PlatformIO deve ora puntare a `firmware/` come project root, non più alla
+vecchia cartella in `Documents`.
 
 ## Architettura software Python
 
@@ -919,7 +928,7 @@ funziona anche a GUI chiusa/PC scollegato).
    Entrambi i fix sono verificati su macchina fisica (vedi `CHANGELOG.md`).
 
 4. **Firmware: spam di `Serial.println()` di debug non prefissati, ad alta
-   frequenza, sul link dati.** `startMotor()` ([main.cpp:642-647](main.cpp#L642-L647))
+   frequenza, sul link dati.** `startMotor()` ([firmware/src/main.cpp:642-647](firmware/src/main.cpp#L642-L647))
    stampa `"DEBUG: startMotor() chiamato"` **ogni volta che viene chiamata** — e in
    `updateMotorState()` viene richiamata ad ogni ciclo di `loop()` quando
    `motor_state == JOG_UP` (o `JOG_DOWN`), cioè potenzialmente migliaia di volte al
@@ -930,7 +939,7 @@ funziona anche a GUI chiusa/PC scollegato).
    parzialmente commentato con `//`, dentro `EXECUTE_RAMP` (righe 499-502, 522-528).
 
 5. **Riuso di variabili di stato ciclico per scopi diversi (hack fragile).**
-   Il comando `EXECUTE_PAUSE` ([main.cpp:465-481](main.cpp#L465-L481)) memorizza la
+   Il comando `EXECUTE_PAUSE` ([firmware/src/main.cpp:465-481](firmware/src/main.cpp#L465-L481)) memorizza la
    durata della pausa dentro `cyclic_hold_upper_ms` — la stessa variabile usata dai
    blocchi ciclici per il tempo di hold al limite superiore — con un commento
    esplicito nel codice: *"Riutilizziamo la variabile degli hold"* /

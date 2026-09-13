@@ -4,6 +4,38 @@ Riepilogo concettuale dei cambiamenti architetturali e delle correzioni
 rilevanti al progetto. Non è un log riga-per-riga dei commit: per quello si
 veda la cronologia git. Ogni voce spiega **cosa** è cambiato e **perché**.
 
+## 2026-09-13
+
+### Ristrutturazione: fuso il repository firmware in questo repo come monorepo
+
+Fino ad oggi il firmware viveva in un repository git separato
+(`Controllo-Macchina-ESP32`, in `c:\Users\carlo\Documents\PlatformIO\Projects\`,
+fuori dalla cartella OneDrive di questo progetto), da tenere sincronizzato a mano
+in coppia con questo repo per ogni modifica che toccava sia GUI sia firmware
+(es. l'aggiunta di un nuovo comando seriale richiedeva due commit separati, uno
+per parte). Il bisogno di lavorare anche da un secondo PC (con la cartella di
+questo progetto già sincronizzata via OneDrive, ma non quella del firmware,
+locale in `Documents` e quindi non replicata automaticamente) ha reso evidente
+la scomodità di avere due repository indipendenti da clonare/gestire.
+
+Il firmware è stato importato in questo repository come sottocartella
+`firmware/`, usando `git subtree add` invece di una semplice copia dei file,
+per **preservare tutta la cronologia commit originale** (visibile con
+`git log -- firmware/`). Il vecchio repository `Controllo-Macchina-ESP32` su
+GitHub è stato **archiviato** (reso di sola lettura, non cancellato); la sua
+cartella locale originale è stata rinominata
+`Controllo-Macchina-ESP32_OLD_backup` invece di essere eliminata, come rete di
+sicurezza temporanea.
+
+Conseguenze pratiche per chi continua a lavorare sul progetto:
+- PlatformIO va ora aperto puntando a `firmware/` come project root, non più
+  alla vecchia cartella in `Documents`.
+- Un solo repository da clonare/sincronizzare su un nuovo PC, e possibilità di
+  fare commit atomici che toccano sia GUI sia firmware in un colpo solo.
+- Tutti i riferimenti al vecchio percorso (`Controllo-Macchina-ESP32/src/main.cpp`)
+  in `CLAUDE.md`, `docs/main.md`, `docs/firmware_main.md` e `TODO.md` sono stati
+  aggiornati a `firmware/src/main.cpp`.
+
 ## 2026-09-10
 
 ### Fix: peso di calibrazione errato per la cella 200N (1398g → 4990g)

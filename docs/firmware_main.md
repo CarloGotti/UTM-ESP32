@@ -1,8 +1,10 @@
-# firmware: Controllo-Macchina-ESP32/src/main.cpp
+# firmware: firmware/src/main.cpp
 
-> File in un repository separato:
-> `c:\Users\carlo\Documents\PlatformIO\Projects\Controllo-Macchina-ESP32\src\main.cpp`
-> (progetto PlatformIO/Arduino, ~1220 righe, unico file sorgente).
+> `firmware/src/main.cpp` (progetto PlatformIO/Arduino, ~1220 righe, unico file
+> sorgente). Dal 2026-09-13 vive in questo stesso repository (fuso via `git subtree`
+> da un repository separato, `Controllo-Macchina-ESP32`, ora archiviato — vedi
+> `CLAUDE.md` e `CHANGELOG.md`); chi apre il progetto in PlatformIO deve puntare a
+> `firmware/` come project root.
 
 ## Scopo
 

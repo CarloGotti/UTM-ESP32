@@ -28,7 +28,7 @@ si ferma).
    - un **nuovo comando firmware** `GET_LIMITS` (oggi non esiste; il
      firmware ha solo `SET_LIMITS`, che è solo in scrittura) che risponda con
      qualcosa tipo `LIMITS:FORCE_G=<val>;PULSES=<val>` — sullo stesso modello
-     già usato per `GET_SCALE`/`SCALE:` in `Controllo-Macchina-ESP32/src/main.cpp`
+     già usato per `GET_SCALE`/`SCALE:` in `firmware/src/main.cpp`
      (comando implementato ma oggi non chiamato da nessun widget, vedi
      `docs/firmware_main.md`).
    - lato Python, un `QTimer` che invii `GET_LIMITS` **periodicamente** (ogni
@@ -52,7 +52,7 @@ round-trip seriale prima di ogni controllo.
 sensore può produrre nuovi campioni fino a 320 volte al secondo
 (`SET_FILTER_CONFIG:...;RATE=320`), ma questo **non significa che
 l'acquisizione registrata sia a 320 Hz**. Il pacchetto `D:` inviato al PC è
-governato da `STREAM_INTERVAL_MS` in `Controllo-Macchina-ESP32/src/main.cpp`
+governato da `STREAM_INTERVAL_MS` in `firmware/src/main.cpp`
 (costante fissa, oggi 20 ms → 50 Hz), indipendente dal sample rate del
 sensore. Un RATE alto con alpha=1 (filtro disattivato) significa solo
 "ultimo campione istantaneo grezzo ogni 20ms", non un'acquisizione a
